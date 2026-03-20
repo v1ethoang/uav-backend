@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import time
-import uuid
 import json
 import hashlib
 import os
@@ -307,6 +306,21 @@ def get_mission_by_id(mission_id: str):
     return row_to_mission(row)
 
 
+def get_mission_by_order_id(order_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM missions
+    WHERE order_id = %s
+    ORDER BY created_ts DESC
+    LIMIT 1
+    """, (order_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row_to_mission(row)
+
+
 def get_drone_by_id(drone_id: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -315,6 +329,34 @@ def get_drone_by_id(drone_id: str):
     cur.close()
     conn.close()
     return row_to_drone(row)
+
+
+def get_next_order_id():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT id
+    FROM orders
+    WHERE id LIKE 'order_%'
+    ORDER BY created_ts DESC
+    LIMIT 500
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    max_num = 0
+    for row in rows:
+        oid = str(row["id"])
+        if not oid.startswith("order_"):
+            continue
+        suffix = oid.replace("order_", "", 1)
+        if suffix.isdigit():
+            n = int(suffix)
+            if n > max_num:
+                max_num = n
+
+    return f"order_{max_num + 1}"
 
 
 # =========================================================
@@ -429,7 +471,7 @@ def register(req: RegisterReq):
     if get_user_by_username(username):
         return {"error": "username_exists"}
 
-    uid = f"user_{uuid.uuid4().hex[:10]}"
+    uid = f"user_{username}"
 
     conn = get_conn()
     cur = conn.cursor()
@@ -465,7 +507,7 @@ def login(req: LoginReq):
     if not user or user["password_hash"] != hash_password(req.password):
         return {"error": "invalid_credentials"}
 
-    token = str(uuid.uuid4())
+    token = f"tok_{int(time.time())}_{username}"
     save_session(token, username)
 
     return {
@@ -580,7 +622,7 @@ def create_order(req: CreateOrderReq, authorization: Optional[str] = Header(defa
     if isinstance(user, dict) and user.get("error"):
         return user
 
-    oid = f"order_{uuid.uuid4().hex[:10]}"
+    oid = get_next_order_id()
 
     order = {
         "id": oid,
@@ -636,6 +678,51 @@ def list_orders(authorization: Optional[str] = Header(default=None)):
     return [row_to_order(r) for r in rows]
 
 
+@app.post("/orders/{order_id}/cancel")
+def cancel_order(order_id: str, authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    if isinstance(user, dict) and user.get("error"):
+        return user
+
+    order = get_order_by_id(order_id)
+    if not order:
+        return {"error": "order_not_found"}
+
+    is_admin = user["role"] == "admin"
+    is_owner = order["created_by"] == user["username"]
+
+    if not is_admin and not is_owner:
+        return {"error": "forbidden"}
+
+    blocked_statuses = ["DELIVERED", "COMPLETED", "DONE", "CANCELLED"]
+    if str(order["status"]).upper() in blocked_statuses:
+        return {"error": "cannot_cancel_order"}
+
+    mission = get_mission_by_order_id(order_id)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    UPDATE orders
+    SET status = %s
+    WHERE id = %s
+    """, ("CANCELLED", order_id))
+
+    if mission and str(mission["status"]).upper() not in ["DONE", "FAILED", "CANCELLED"]:
+        cur.execute("""
+        UPDATE missions
+        SET status = %s
+        WHERE id = %s
+        """, ("CANCELLED", mission["id"]))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"ok": True, "order_id": order_id, "status": "CANCELLED"}
+
+
 # =========================================================
 # MISSIONS API
 # =========================================================
@@ -650,11 +737,14 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
     if not order:
         return {"error": "order_not_found"}
 
+    if str(order["status"]).upper() == "CANCELLED":
+        return {"error": "order_cancelled"}
+
     drone = get_drone_by_id(req.drone_id)
     if not drone:
         return {"error": "drone_not_found"}
 
-    mid = f"mission_{uuid.uuid4().hex[:10]}"
+    mid = f"mission_{int(time.time() * 1000)}"
     drop = order["dropoff"]
 
     waypoints = [
@@ -721,6 +811,9 @@ def start_mission(mission_id: str, authorization: Optional[str] = Header(default
     mission = get_mission_by_id(mission_id)
     if not mission:
         return {"error": "mission_not_found"}
+
+    if str(mission["status"]).upper() == "CANCELLED":
+        return {"error": "mission_cancelled"}
 
     conn = get_conn()
     cur = conn.cursor()
@@ -858,6 +951,9 @@ def bridge_event(req: EventReq):
     mission = get_mission_by_id(req.mission_id)
     if not mission:
         return {"ok": False, "error": "mission_not_found"}
+
+    if str(mission["status"]).upper() == "CANCELLED":
+        return {"ok": False, "error": "mission_cancelled"}
 
     conn = get_conn()
     cur = conn.cursor()
