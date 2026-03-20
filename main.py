@@ -4,12 +4,14 @@ from pydantic import BaseModel
 from typing import Optional
 import time
 import uuid
-import sqlite3
 import json
 import hashlib
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
-app = FastAPI(title="Drone Delivery Backend (MVP)")
+
+app = FastAPI(title="Drone Delivery Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,6 +20,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.middleware("http")
 async def add_process_time_header(request, call_next):
@@ -29,7 +32,7 @@ async def add_process_time_header(request, call_next):
 # CONFIG
 # =========================================================
 
-DB_PATH = os.getenv("DB_PATH", "uav.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 def now_ms():
@@ -41,9 +44,9 @@ def hash_password(password: str) -> str:
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_db():
@@ -60,7 +63,7 @@ def init_db():
         email TEXT DEFAULT '',
         phone TEXT DEFAULT '',
         address TEXT DEFAULT '',
-        created_ts INTEGER NOT NULL
+        created_ts BIGINT NOT NULL
     )
     """)
 
@@ -68,7 +71,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         username TEXT NOT NULL,
-        created_ts INTEGER NOT NULL
+        created_ts BIGINT NOT NULL
     )
     """)
 
@@ -77,8 +80,8 @@ def init_db():
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         status TEXT NOT NULL,
-        last TEXT,
-        last_seen INTEGER
+        last_json TEXT,
+        last_seen BIGINT
     )
     """)
 
@@ -86,10 +89,10 @@ def init_db():
     CREATE TABLE IF NOT EXISTS orders (
         id TEXT PRIMARY KEY,
         created_by TEXT NOT NULL,
-        dropoff TEXT NOT NULL,
+        dropoff_json TEXT NOT NULL,
         note TEXT,
         status TEXT NOT NULL,
-        created_ts INTEGER NOT NULL
+        created_ts BIGINT NOT NULL
     )
     """)
 
@@ -99,23 +102,23 @@ def init_db():
         order_id TEXT NOT NULL,
         drone_id TEXT NOT NULL,
         status TEXT NOT NULL,
-        altitude_m REAL NOT NULL,
-        warehouse_lat REAL NOT NULL,
-        warehouse_lng REAL NOT NULL,
-        waypoints TEXT NOT NULL,
+        altitude_m DOUBLE PRECISION NOT NULL,
+        warehouse_lat DOUBLE PRECISION NOT NULL,
+        warehouse_lng DOUBLE PRECISION NOT NULL,
+        waypoints_json TEXT NOT NULL,
         created_by TEXT NOT NULL,
-        created_ts INTEGER NOT NULL
+        created_ts BIGINT NOT NULL
     )
     """)
 
     # Seed admin
-    cur.execute("SELECT username FROM users WHERE username = ?", ("admin",))
+    cur.execute("SELECT username FROM users WHERE username = %s", ("admin",))
     if not cur.fetchone():
         cur.execute("""
         INSERT INTO users (
             id, username, password_hash, role,
             full_name, email, phone, address, created_ts
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             "user_admin",
             "admin",
@@ -129,14 +132,15 @@ def init_db():
         ))
 
     # Seed drone
-    cur.execute("SELECT id FROM drones WHERE id = ?", ("drone_1",))
+    cur.execute("SELECT id FROM drones WHERE id = %s", ("drone_1",))
     if not cur.fetchone():
         cur.execute("""
-        INSERT INTO drones (id, name, status, last, last_seen)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO drones (id, name, status, last_json, last_seen)
+        VALUES (%s, %s, %s, %s, %s)
         """, ("drone_1", "SITL-1", "IDLE", None, None))
 
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -233,7 +237,7 @@ def row_to_user(row):
 def row_to_drone(row):
     if not row:
         return None
-    last = json.loads(row["last"]) if row["last"] else None
+    last = json.loads(row["last_json"]) if row["last_json"] else None
     return {
         "id": row["id"],
         "name": row["name"],
@@ -249,7 +253,7 @@ def row_to_order(row):
     return {
         "id": row["id"],
         "created_by": row["created_by"],
-        "dropoff": json.loads(row["dropoff"]),
+        "dropoff": json.loads(row["dropoff_json"]),
         "note": row["note"],
         "status": row["status"],
         "created_ts": row["created_ts"]
@@ -267,7 +271,7 @@ def row_to_mission(row):
         "altitude_m": row["altitude_m"],
         "warehouse_lat": row["warehouse_lat"],
         "warehouse_lng": row["warehouse_lng"],
-        "waypoints": json.loads(row["waypoints"]),
+        "waypoints": json.loads(row["waypoints_json"]),
         "created_by": row["created_by"],
         "created_ts": row["created_ts"]
     }
@@ -276,8 +280,9 @@ def row_to_mission(row):
 def get_user_by_username(username: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row_to_user(row)
 
@@ -285,8 +290,9 @@ def get_user_by_username(username: str):
 def get_order_by_id(order_id: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+    cur.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row_to_order(row)
 
@@ -294,8 +300,9 @@ def get_order_by_id(order_id: str):
 def get_mission_by_id(mission_id: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
+    cur.execute("SELECT * FROM missions WHERE id = %s", (mission_id,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row_to_mission(row)
 
@@ -303,8 +310,9 @@ def get_mission_by_id(mission_id: str):
 def get_drone_by_id(drone_id: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM drones WHERE id = ?", (drone_id,))
+    cur.execute("SELECT * FROM drones WHERE id = %s", (drone_id,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row_to_drone(row)
 
@@ -325,18 +333,24 @@ def save_session(token: str, username: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-    INSERT OR REPLACE INTO sessions (token, username, created_ts)
-    VALUES (?, ?, ?)
+    INSERT INTO sessions (token, username, created_ts)
+    VALUES (%s, %s, %s)
+    ON CONFLICT (token)
+    DO UPDATE SET
+        username = EXCLUDED.username,
+        created_ts = EXCLUDED.created_ts
     """, (token, username, now_ms()))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def get_session_username(token: str) -> Optional[str]:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT username FROM sessions WHERE token = ?", (token,))
+    cur.execute("SELECT username FROM sessions WHERE token = %s", (token,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row["username"] if row else None
 
@@ -344,8 +358,9 @@ def get_session_username(token: str) -> Optional[str]:
 def delete_session(token: str):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -422,7 +437,7 @@ def register(req: RegisterReq):
     INSERT INTO users (
         id, username, password_hash, role,
         full_name, email, phone, address, created_ts
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         uid,
         username,
@@ -435,6 +450,7 @@ def register(req: RegisterReq):
         now_ms()
     ))
     conn.commit()
+    cur.close()
     conn.close()
 
     user = get_user_by_username(username)
@@ -497,10 +513,11 @@ def change_password(req: ChangePasswordReq, authorization: Optional[str] = Heade
     cur = conn.cursor()
     cur.execute("""
     UPDATE users
-    SET password_hash = ?
-    WHERE username = ?
+    SET password_hash = %s
+    WHERE username = %s
     """, (hash_password(req.new_password), user["username"]))
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"ok": True, "message": "password_changed"}
@@ -520,8 +537,8 @@ def update_me(req: UpdateProfileReq, authorization: Optional[str] = Header(defau
     cur = conn.cursor()
     cur.execute("""
     UPDATE users
-    SET full_name = ?, email = ?, phone = ?, address = ?
-    WHERE username = ?
+    SET full_name = %s, email = %s, phone = %s, address = %s
+    WHERE username = %s
     """, (
         (req.full_name or "").strip(),
         (req.email or "").strip(),
@@ -530,6 +547,7 @@ def update_me(req: UpdateProfileReq, authorization: Optional[str] = Header(defau
         user["username"]
     ))
     conn.commit()
+    cur.close()
     conn.close()
 
     updated = get_user_by_username(user["username"])
@@ -546,6 +564,7 @@ def list_users(authorization: Optional[str] = Header(default=None)):
     cur = conn.cursor()
     cur.execute("SELECT * FROM users ORDER BY created_ts DESC")
     rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     return [public_user(row_to_user(r)) for r in rows]
@@ -575,8 +594,8 @@ def create_order(req: CreateOrderReq, authorization: Optional[str] = Header(defa
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-    INSERT INTO orders (id, created_by, dropoff, note, status, created_ts)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO orders (id, created_by, dropoff_json, note, status, created_ts)
+    VALUES (%s, %s, %s, %s, %s, %s)
     """, (
         order["id"],
         order["created_by"],
@@ -586,6 +605,7 @@ def create_order(req: CreateOrderReq, authorization: Optional[str] = Header(defa
         order["created_ts"]
     ))
     conn.commit()
+    cur.close()
     conn.close()
 
     return order
@@ -605,11 +625,12 @@ def list_orders(authorization: Optional[str] = Header(default=None)):
     else:
         cur.execute("""
         SELECT * FROM orders
-        WHERE created_by = ?
+        WHERE created_by = %s
         ORDER BY created_ts DESC
         """, (user["username"],))
 
     rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     return [row_to_order(r) for r in rows]
@@ -663,8 +684,8 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
     cur.execute("""
     INSERT INTO missions (
         id, order_id, drone_id, status, altitude_m,
-        warehouse_lat, warehouse_lng, waypoints, created_by, created_ts
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         mission["id"],
         mission["order_id"],
@@ -680,11 +701,12 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
 
     cur.execute("""
     UPDATE orders
-    SET status = ?
-    WHERE id = ?
+    SET status = %s
+    WHERE id = %s
     """, ("QUEUED", req.order_id))
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return mission
@@ -705,17 +727,18 @@ def start_mission(mission_id: str, authorization: Optional[str] = Header(default
 
     cur.execute("""
     UPDATE missions
-    SET status = ?
-    WHERE id = ?
+    SET status = %s
+    WHERE id = %s
     """, ("START_REQUESTED", mission_id))
 
     cur.execute("""
     UPDATE orders
-    SET status = ?
-    WHERE id = ?
+    SET status = %s
+    WHERE id = %s
     """, ("ASSIGNED", mission["order_id"]))
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"ok": True}
@@ -738,11 +761,12 @@ def list_missions(authorization: Optional[str] = Header(default=None)):
         SELECT m.*
         FROM missions m
         JOIN orders o ON m.order_id = o.id
-        WHERE o.created_by = ?
+        WHERE o.created_by = %s
         ORDER BY m.created_ts DESC
         """, (user["username"],))
         rows = cur.fetchall()
 
+    cur.close()
     conn.close()
     return [row_to_mission(r) for r in rows]
 
@@ -758,13 +782,14 @@ def bridge_next_mission(drone_id: str):
 
     cur.execute("""
     SELECT * FROM missions
-    WHERE drone_id = ? AND status = ?
+    WHERE drone_id = %s AND status = %s
     ORDER BY created_ts ASC
     LIMIT 1
     """, (drone_id, "START_REQUESTED"))
 
     row = cur.fetchone()
     if not row:
+        cur.close()
         conn.close()
         return {"mission": None}
 
@@ -772,17 +797,18 @@ def bridge_next_mission(drone_id: str):
 
     cur.execute("""
     UPDATE missions
-    SET status = ?
-    WHERE id = ?
+    SET status = %s
+    WHERE id = %s
     """, ("RUNNING", mission["id"]))
 
     cur.execute("""
     UPDATE orders
-    SET status = ?
-    WHERE id = ?
+    SET status = %s
+    WHERE id = %s
     """, ("IN_FLIGHT", mission["order_id"]))
 
     conn.commit()
+    cur.close()
     conn.close()
 
     updated = get_mission_by_id(mission["id"])
@@ -817,10 +843,11 @@ def bridge_telemetry(req: TelemetryReq):
     cur = conn.cursor()
     cur.execute("""
     UPDATE drones
-    SET status = ?, last = ?, last_seen = ?
-    WHERE id = ?
+    SET status = %s, last_json = %s, last_seen = %s
+    WHERE id = %s
     """, (status, json.dumps(last_data), now_ms(), req.drone_id))
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"ok": True}
@@ -836,20 +863,21 @@ def bridge_event(req: EventReq):
     cur = conn.cursor()
 
     if req.type == "ARRIVED":
-        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("ARRIVED", mission["order_id"]))
+        cur.execute("UPDATE orders SET status = %s WHERE id = %s", ("ARRIVED", mission["order_id"]))
 
     elif req.type == "DELIVERED":
-        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("DELIVERED", mission["order_id"]))
+        cur.execute("UPDATE orders SET status = %s WHERE id = %s", ("DELIVERED", mission["order_id"]))
 
     elif req.type == "COMPLETED":
-        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("COMPLETED", mission["order_id"]))
-        cur.execute("UPDATE missions SET status = ? WHERE id = ?", ("DONE", req.mission_id))
+        cur.execute("UPDATE orders SET status = %s WHERE id = %s", ("COMPLETED", mission["order_id"]))
+        cur.execute("UPDATE missions SET status = %s WHERE id = %s", ("DONE", req.mission_id))
 
     elif req.type == "FAILED":
-        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("FAILED", mission["order_id"]))
-        cur.execute("UPDATE missions SET status = ? WHERE id = ?", ("FAILED", req.mission_id))
+        cur.execute("UPDATE orders SET status = %s WHERE id = %s", ("FAILED", mission["order_id"]))
+        cur.execute("UPDATE missions SET status = %s WHERE id = %s", ("FAILED", req.mission_id))
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"ok": True}
@@ -863,9 +891,10 @@ def complete_mission(mission_id: str):
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("UPDATE missions SET status = ? WHERE id = ?", ("DONE", mission_id))
-    cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("COMPLETED", mission["order_id"]))
+    cur.execute("UPDATE missions SET status = %s WHERE id = %s", ("DONE", mission_id))
+    cur.execute("UPDATE orders SET status = %s WHERE id = %s", ("COMPLETED", mission["order_id"]))
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"ok": True}
@@ -885,6 +914,7 @@ def list_drones(authorization: Optional[str] = Header(default=None)):
     cur = conn.cursor()
     cur.execute("SELECT * FROM drones ORDER BY id ASC")
     rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     return [row_to_drone(r) for r in rows]
