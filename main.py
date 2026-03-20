@@ -464,7 +464,7 @@ def get_next_mission_id():
     conn.close()
 
     max_num = int(row["max_num"] or 0)
-    return f"mission_{max_num + 1}"
+    return f"mission_{now_ms()}"
 
 
 # =========================================================
