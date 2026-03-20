@@ -6,28 +6,45 @@ from dronekit import connect, VehicleMode, LocationGlobalRelative
 from pymavlink import mavutil
 
 
-BACKEND = "http://127.0.0.1:8080"
+# =========================================================
+# CONFIG
+# =========================================================
+
+BACKEND = "http://127.0.0.1:8080"   # đổi nếu backend chạy chỗ khác
 DRONE_ID = "drone_1"
 CONNECTION = "127.0.0.1:14552"
+
+MISSION_POLL_SEC = 2.0
+TELEMETRY_TIMEOUT = 1.0
+EVENT_TIMEOUT = 2.0
+REQUEST_TIMEOUT = 2.0
+
 
 # ==============================
 # FLIGHT TUNING
 # ==============================
-MIN_CRUISE_SPEED = 3.0       # m/s
-MAX_CRUISE_SPEED = 10.0      # m/s
-APPROACH_MIN_SPEED = 1.8     # m/s, chỉ dùng khi còn <= 3m
-DESCEND_SPEED = 1.8          # m/s
-RETURN_MAX_SPEED = 8.0       # m/s
+MIN_CRUISE_SPEED = 3.0
+MAX_CRUISE_SPEED = 10.0
+APPROACH_MIN_SPEED = 1.8
+DESCEND_SPEED = 1.8
+RETURN_MAX_SPEED = 8.0
 
-WAYPOINT_RADIUS = 1.0        # m
-ALT_TOLERANCE = 0.8          # m
-DELIVERY_ALT = 6.0           # m
-HOME_LAND_ALT = 4.0          # m
-DELIVERY_HOLD_SEC = 0.3      # s
-GOTO_TIMEOUT = 180           # s
+WAYPOINT_RADIUS = 1.0
+ALT_TOLERANCE = 0.8
+DELIVERY_ALT = 6.0
+HOME_LAND_ALT = 4.0
+DELIVERY_HOLD_SEC = 0.3
+GOTO_TIMEOUT = 180
 
-APPROACH_BRAKE_DISTANCE = 3.0   # m, chỉ lúc này mới giảm tốc
-GOTO_LOG_PERIOD = 1.0           # s
+APPROACH_BRAKE_DISTANCE = 3.0
+GOTO_LOG_PERIOD = 1.0
+
+
+# =========================================================
+# HTTP SESSION
+# =========================================================
+
+http = requests.Session()
 
 
 # =========================================================
@@ -38,9 +55,13 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+
 def get_distance(a, b):
     """
-    Tính khoảng cách ngang giữa 2 điểm GPS, đơn vị mét.
+    Khoảng cách ngang giữa 2 điểm GPS (m).
     """
     R = 6371000.0
 
@@ -56,23 +77,11 @@ def get_distance(a, b):
     return 2.0 * R * math.asin(math.sqrt(h))
 
 
-def wait_alt(vehicle, alt):
-    while True:
-        current = vehicle.location.global_relative_frame.alt
-        print(f"ALT: {current}")
-
-        if current is not None and current >= alt * 0.95:
-            break
-
-        send_telemetry(vehicle)
-        time.sleep(1)
+def clamp_speed(speed_mps, max_speed):
+    return max(0.8, min(speed_mps, max_speed))
 
 
 def compute_cruise_speed_by_distance(distance_m):
-    """
-    Xa thì bay nhanh hơn.
-    Chú ý: quãng đường ngắn thì dù set cao, drone vẫn khó đạt max thật.
-    """
     if distance_m >= 200:
         return 10.0
     elif distance_m >= 120:
@@ -86,25 +95,64 @@ def compute_cruise_speed_by_distance(distance_m):
 
 
 def compute_approach_speed(remaining_dist, cruise_speed):
-    """
-    Chỉ giảm tốc khi còn rất gần mục tiêu.
-    """
     if remaining_dist <= APPROACH_BRAKE_DISTANCE:
         return APPROACH_MIN_SPEED
     return cruise_speed
 
 
-def clamp_speed(speed_mps, max_speed):
-    return max(0.8, min(speed_mps, max_speed))
-
-
 def set_vehicle_speed(vehicle, speed_mps, max_speed=MAX_CRUISE_SPEED):
-    """
-    Chỉ set groundspeed, không set param liên tục trong loop.
-    """
     speed_mps = clamp_speed(speed_mps, max_speed)
     vehicle.groundspeed = speed_mps
     return speed_mps
+
+
+def ensure_home(vehicle, wait_sec=20):
+    """
+    Đảm bảo có home_location.
+    Nếu chưa có thì chờ. Nếu vẫn chưa có thì fallback về vị trí hiện tại.
+    """
+    if vehicle.home_location is not None:
+        return vehicle.home_location
+
+    log("Waiting home location init...")
+    start = time.time()
+
+    while time.time() - start < wait_sec:
+        if vehicle.home_location is not None:
+            return vehicle.home_location
+        send_telemetry(vehicle)
+        time.sleep(1)
+
+    current = vehicle.location.global_frame
+    if current and current.lat is not None and current.lon is not None:
+        log("Home location not ready, fallback to current global position")
+        return current
+
+    return None
+
+
+def validate_mission(mission):
+    if not isinstance(mission, dict):
+        return False, "mission_not_dict"
+
+    if "id" not in mission:
+        return False, "mission_missing_id"
+
+    if "order_id" not in mission:
+        return False, "mission_missing_order_id"
+
+    if "waypoints" not in mission:
+        return False, "mission_missing_waypoints"
+
+    wps = mission.get("waypoints")
+    if not isinstance(wps, list) or len(wps) == 0:
+        return False, "mission_empty_waypoints"
+
+    wp = wps[0]
+    if "lat" not in wp or "lng" not in wp or "alt_m" not in wp:
+        return False, "waypoint_missing_fields"
+
+    return True, None
 
 
 # =========================================================
@@ -112,22 +160,24 @@ def set_vehicle_speed(vehicle, speed_mps, max_speed=MAX_CRUISE_SPEED):
 # =========================================================
 
 def send_telemetry(vehicle):
-    pos = vehicle.location.global_relative_frame
-
-    payload = {
-        "drone_id": DRONE_ID,
-        "lat": pos.lat,
-        "lng": pos.lon,
-        "alt_m": pos.alt,
-        "groundspeed_mps": float(vehicle.groundspeed or 0.0),
-        "battery_percent": None,
-        "mode": vehicle.mode.name if vehicle.mode else None,
-        "armed": vehicle.armed,
-        "ts_ms": now_ms()
-    }
-
     try:
-        requests.post(f"{BACKEND}/bridge/telemetry", json=payload, timeout=1)
+        pos = vehicle.location.global_relative_frame
+        if pos is None or pos.lat is None or pos.lon is None:
+            return
+
+        payload = {
+            "drone_id": DRONE_ID,
+            "lat": pos.lat,
+            "lng": pos.lon,
+            "alt_m": pos.alt if pos.alt is not None else 0.0,
+            "groundspeed_mps": float(vehicle.groundspeed or 0.0),
+            "battery_percent": None,
+            "mode": vehicle.mode.name if vehicle.mode else None,
+            "armed": bool(vehicle.armed),
+            "ts_ms": now_ms()
+        }
+
+        http.post(f"{BACKEND}/bridge/telemetry", json=payload, timeout=TELEMETRY_TIMEOUT)
     except Exception:
         pass
 
@@ -142,38 +192,60 @@ def send_event(mission_id, event_type, detail=None):
     }
 
     try:
-        requests.post(f"{BACKEND}/bridge/event", json=payload, timeout=2)
-    except Exception:
-        pass
+        http.post(f"{BACKEND}/bridge/event", json=payload, timeout=EVENT_TIMEOUT)
+        log(f"EVENT -> {event_type} ({mission_id})")
+    except Exception as e:
+        log(f"EVENT send failed: {event_type}, err={e}")
 
 
 # =========================================================
 # TAKEOFF
 # =========================================================
 
+def wait_alt(vehicle, target_alt, timeout=60):
+    start = time.time()
+
+    while True:
+        current = vehicle.location.global_relative_frame.alt
+        log(f"ALT: {current}")
+
+        if current is not None and current >= target_alt * 0.95:
+            return True
+
+        if time.time() - start > timeout:
+            log("wait_alt timeout")
+            return False
+
+        send_telemetry(vehicle)
+        time.sleep(1)
+
+
 def arm_takeoff(vehicle, alt):
-    print("Waiting armable...")
+    log("Waiting armable...")
     while not vehicle.is_armable:
         send_telemetry(vehicle)
         time.sleep(1)
 
-    print("Switch GUIDED...")
+    log("Switch GUIDED...")
     vehicle.mode = VehicleMode("GUIDED")
     while vehicle.mode.name != "GUIDED":
         send_telemetry(vehicle)
         time.sleep(0.5)
 
-    print("Arming...")
+    log("Arming...")
     vehicle.armed = True
     while not vehicle.armed:
         send_telemetry(vehicle)
         time.sleep(0.5)
 
-    print(f"Takeoff to {alt} m")
+    log(f"Takeoff to {alt:.2f} m")
     vehicle.simple_takeoff(alt)
 
-    wait_alt(vehicle, alt)
-    print("Altitude reached")
+    ok = wait_alt(vehicle, alt)
+    if not ok:
+        raise Exception("takeoff_alt_timeout")
+
+    log("Altitude reached")
 
 
 # =========================================================
@@ -181,12 +253,6 @@ def arm_takeoff(vehicle, alt):
 # =========================================================
 
 def goto(vehicle, lat, lon, alt, base_speed=None, timeout=GOTO_TIMEOUT, max_speed=MAX_CRUISE_SPEED):
-    """
-    Bay tới waypoint:
-    - gửi simple_goto đúng 1 lần
-    - giữ cruise speed tới khi còn <= APPROACH_BRAKE_DISTANCE
-    - chỉ đổi groundspeed khi cần
-    """
     wp = LocationGlobalRelative(lat, lon, alt)
 
     current = vehicle.location.global_relative_frame
@@ -199,15 +265,12 @@ def goto(vehicle, lat, lon, alt, base_speed=None, timeout=GOTO_TIMEOUT, max_spee
 
     cruise_speed = clamp_speed(cruise_speed, max_speed)
 
-    print(
+    log(
         f"GOTO lat={lat:.6f}, lon={lon:.6f}, alt={alt:.2f}, "
         f"dist={initial_dist:.2f}m, cruise={cruise_speed:.2f}m/s"
     )
 
-    # set speed trước rồi mới goto
     current_cmd_speed = set_vehicle_speed(vehicle, cruise_speed, max_speed=max_speed)
-
-    # Gửi 1 lần duy nhất
     vehicle.simple_goto(wp)
 
     start = time.time()
@@ -227,22 +290,22 @@ def goto(vehicle, lat, lon, alt, base_speed=None, timeout=GOTO_TIMEOUT, max_spee
 
         if abs(target_speed - current_cmd_speed) >= 0.2:
             current_cmd_speed = set_vehicle_speed(vehicle, target_speed, max_speed=max_speed)
-            print(f"Speed update -> target_speed={current_cmd_speed:.2f} m/s")
+            log(f"Speed update -> target_speed={current_cmd_speed:.2f} m/s")
 
         if now - last_print >= GOTO_LOG_PERIOD:
-            print(
+            log(
                 f"GOTO dist={dist:.2f}m alt={alt_now:.2f}m alt_err={alt_err:.2f}m "
                 f"target_speed={current_cmd_speed:.2f}m/s actual_speed={actual_speed:.2f}m/s"
             )
             last_print = now
 
         if dist <= WAYPOINT_RADIUS and alt_err <= ALT_TOLERANCE:
-            print("Waypoint reached")
-            break
+            log("Waypoint reached")
+            return True
 
         if now - start > timeout:
-            print("Waypoint timeout")
-            break
+            log("Waypoint timeout")
+            return False
 
         send_telemetry(vehicle)
         time.sleep(0.3)
@@ -253,27 +316,26 @@ def goto(vehicle, lat, lon, alt, base_speed=None, timeout=GOTO_TIMEOUT, max_spee
 # =========================================================
 
 def payload_drop(vehicle):
-    print("Drop payload")
+    log("Drop payload")
 
     open_msg = vehicle.message_factory.command_long_encode(
         0, 0,
         mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
         0,
-        9,      # servo channel
-        1900,   # pwm open
+        9,
+        1900,
         0, 0, 0, 0, 0
     )
     vehicle.send_mavlink(open_msg)
     vehicle.flush()
-
     time.sleep(0.8)
 
     close_msg = vehicle.message_factory.command_long_encode(
         0, 0,
         mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
         0,
-        9,      # servo channel
-        1100,   # pwm close
+        9,
+        1100,
         0, 0, 0, 0, 0
     )
     vehicle.send_mavlink(close_msg)
@@ -288,13 +350,15 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
     lat = float(wp["lat"])
     lon = float(wp["lng"])
 
-    print("Fly to delivery point")
-    goto(vehicle, lat, lon, cruise_alt)
+    log("Fly to delivery point")
+    ok = goto(vehicle, lat, lon, cruise_alt)
+    if not ok:
+        raise Exception("goto_delivery_timeout")
 
     send_event(mission_id, "ARRIVED")
 
-    print("Descend for delivery")
-    goto(
+    log("Descend for delivery")
+    ok = goto(
         vehicle,
         lat,
         lon,
@@ -303,16 +367,18 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
         timeout=90,
         max_speed=DESCEND_SPEED
     )
+    if not ok:
+        raise Exception("descend_delivery_timeout")
 
-    print("Brief stabilize")
+    log("Brief stabilize")
     time.sleep(DELIVERY_HOLD_SEC)
 
-    print("Drop payload now")
+    log("Drop payload now")
     payload_drop(vehicle)
     send_event(mission_id, "DELIVERED")
 
-    print("Climb back to cruise altitude")
-    goto(
+    log("Climb back to cruise altitude")
+    ok = goto(
         vehicle,
         lat,
         lon,
@@ -321,6 +387,8 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
         timeout=90,
         max_speed=3.0
     )
+    if not ok:
+        raise Exception("climb_after_drop_timeout")
 
 
 # =========================================================
@@ -328,17 +396,12 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
 # =========================================================
 
 def return_home(vehicle, cruise_alt, mission_id):
-    home = vehicle.home_location
-
+    home = ensure_home(vehicle, wait_sec=20)
     if home is None:
-        print("Waiting home location...")
-        while home is None:
-            home = vehicle.home_location
-            send_telemetry(vehicle)
-            time.sleep(1)
+        raise Exception("home_location_unavailable")
 
-    print("Return home at cruise altitude")
-    goto(
+    log("Return home at cruise altitude")
+    ok = goto(
         vehicle,
         home.lat,
         home.lon,
@@ -347,9 +410,11 @@ def return_home(vehicle, cruise_alt, mission_id):
         timeout=GOTO_TIMEOUT,
         max_speed=RETURN_MAX_SPEED
     )
+    if not ok:
+        raise Exception("return_home_timeout")
 
-    print("Descend near home by GPS")
-    goto(
+    log("Descend near home by GPS")
+    ok = goto(
         vehicle,
         home.lat,
         home.lon,
@@ -358,19 +423,37 @@ def return_home(vehicle, cruise_alt, mission_id):
         timeout=120,
         max_speed=2.2
     )
+    if not ok:
+        raise Exception("home_descend_timeout")
 
-    print("Switch to LAND")
+    log("Switch to LAND")
     vehicle.mode = VehicleMode("LAND")
     while vehicle.mode.name != "LAND":
         send_telemetry(vehicle)
         time.sleep(0.5)
 
+    log("Waiting disarm...")
     while vehicle.armed:
         send_telemetry(vehicle)
         time.sleep(1)
 
-    print("Landed and disarmed")
+    log("Landed and disarmed")
     send_event(mission_id, "COMPLETED")
+
+
+# =========================================================
+# FAILSAFE / RECOVERY
+# =========================================================
+
+def safe_land(vehicle):
+    try:
+        log("SAFE LAND triggered")
+        vehicle.mode = VehicleMode("LAND")
+        while vehicle.mode.name != "LAND":
+            send_telemetry(vehicle)
+            time.sleep(0.5)
+    except Exception as e:
+        log(f"safe_land error: {e}")
 
 
 # =========================================================
@@ -378,18 +461,18 @@ def return_home(vehicle, cruise_alt, mission_id):
 # =========================================================
 
 def execute_mission(vehicle, mission):
-    wps = mission.get("waypoints", [])
-    if not wps:
-        print("Mission has no waypoints")
-        return
+    ok, reason = validate_mission(mission)
+    if not ok:
+        raise Exception(reason)
 
+    wps = mission["waypoints"]
     cruise_alt = max(10.0, float(wps[0]["alt_m"]))
-    print(f"Cruise altitude: {cruise_alt:.2f} m")
+    log(f"Mission {mission['id']} | order={mission['order_id']} | cruise_alt={cruise_alt:.2f}m")
 
     arm_takeoff(vehicle, cruise_alt)
 
     for i, wp in enumerate(wps, start=1):
-        print(f"Delivery point {i}/{len(wps)}")
+        log(f"Delivery point {i}/{len(wps)}")
         deliver(vehicle, wp, cruise_alt, mission["id"])
 
     return_home(vehicle, cruise_alt, mission["id"])
@@ -399,88 +482,95 @@ def execute_mission(vehicle, mission):
 # MISSION POLL
 # =========================================================
 
+def fetch_next_mission():
+    try:
+        r = http.get(
+            f"{BACKEND}/bridge/missions/next",
+            params={"drone_id": DRONE_ID},
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if r.status_code != 200:
+            log(f"Mission fetch bad status: {r.status_code}")
+            return None
+
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+
+        mission = data.get("mission")
+        return mission
+    except Exception as e:
+        log(f"Mission fetch error: {e}")
+        return None
+
+
 def mission_loop(vehicle):
-    last_id = None
-
     while True:
-        mission = None
+        mission = fetch_next_mission()
 
-        try:
-            r = requests.get(
-                f"{BACKEND}/bridge/missions/next",
-                params={"drone_id": DRONE_ID},
-                timeout=2
-            )
+        if mission:
+            mid = mission.get("id")
+            log(f"NEW MISSION: {mid}")
 
-            if r.status_code == 200:
-                data = r.json()
-                if isinstance(data, dict):
-                    mission = data.get("mission")
-
-        except Exception as e:
-            print("Mission fetch error:", e)
-
-        if mission and "id" in mission and "waypoints" in mission:
-            mid = mission["id"]
-
-            if mid != last_id:
-                print("NEW MISSION:", mid)
-                last_id = mid
-
-                try:
-                    execute_mission(vehicle, mission)
-                except Exception as e:
-                    print("Mission execution error:", e)
-                    send_event(mid, "FAILED", detail=str(e))
+            try:
+                execute_mission(vehicle, mission)
+                log(f"MISSION DONE: {mid}")
+            except Exception as e:
+                log(f"Mission execution error: {e}")
+                send_event(mid, "FAILED", detail=str(e))
+                safe_land(vehicle)
 
         send_telemetry(vehicle)
-        time.sleep(2)
+        time.sleep(MISSION_POLL_SEC)
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
-print("Connecting vehicle...")
-vehicle = connect(CONNECTION, wait_ready=True)
+def setup_vehicle_params(vehicle):
+    log("Setting flight parameters...")
 
-print("Connected")
-time.sleep(2)
+    params = {
+        "WP_SPD": 1000,
+        "WP_ACC": 700,
+        "WP_ACC_Z": 250,
+        "WP_SPD_UP": 350,
+        "WP_SPD_DN": 250,
+        "WP_RADIUS_M": 100
+    }
 
-vehicle.wait_ready("parameters")
+    for k, v in params.items():
+        try:
+            vehicle.parameters[k] = v
+            time.sleep(0.5)
+            log(f"Set {k} = {vehicle.parameters[k]}")
+        except Exception as e:
+            log(f"Failed to set {k}: {e}")
 
-print("Setting flight parameters...")
 
-params = {
-    "WP_SPD": 1000,       # cm/s = 10 m/s
-    "WP_ACC": 700,        # cm/s^2 = 7 m/s^2
-    "WP_ACC_Z": 250,      # vertical accel
-    "WP_SPD_UP": 350,     # cm/s = 3.5 m/s
-    "WP_SPD_DN": 250,     # cm/s = 2.5 m/s
-    "WP_RADIUS_M": 100        # cm = 1.0 m
-}
+def main():
+    log("Connecting vehicle...")
+    vehicle = connect(CONNECTION, wait_ready=True)
+    log("Connected")
 
-for k, v in params.items():
+    time.sleep(2)
+    vehicle.wait_ready("parameters")
+
+    setup_vehicle_params(vehicle)
+
     try:
-        vehicle.parameters[k] = v
-        time.sleep(0.5)
-        print(f"Set {k} = {vehicle.parameters[k]}")
+        ensure_home(vehicle, wait_sec=20)
     except Exception as e:
-        print(f"Failed to set {k}: {e}")
+        log(f"Home init warning: {e}")
 
-# chờ home ổn định
-try:
-    print("Waiting home location init...")
-    for _ in range(20):
-        if vehicle.home_location is not None:
-            break
-        send_telemetry(vehicle)
-        time.sleep(1)
-except Exception:
-    pass
+    if vehicle.mode.name == "RTL":
+        log("Failsafe triggered: vehicle currently in RTL")
 
-if vehicle.mode.name == "RTL":
-    print("Failsafe triggered: vehicle currently in RTL")
+    log("Start mission polling...")
+    mission_loop(vehicle)
 
-print("Start mission polling...")
-mission_loop(vehicle)
+
+if __name__ == "__main__":
+    main()
