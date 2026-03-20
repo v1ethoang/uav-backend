@@ -14,10 +14,10 @@ BACKEND = "https://uav-backend-zbti.onrender.com"   # đổi nếu backend chạ
 DRONE_ID = "drone_1"
 CONNECTION = "127.0.0.1:14552"
 
-MISSION_POLL_SEC = 2.0
+MISSION_POLL_SEC = 3.0
 TELEMETRY_TIMEOUT = 1.0
 EVENT_TIMEOUT = 2.0
-REQUEST_TIMEOUT = 2.0
+REQUEST_TIMEOUT = 8.0
 
 
 # ==============================
