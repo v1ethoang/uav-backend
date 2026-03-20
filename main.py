@@ -434,6 +434,21 @@ def public_user(user: dict) -> dict:
         "created_ts": user.get("created_ts")
     }
 
+def get_active_mission_by_order_id(order_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    SELECT * FROM missions
+    WHERE order_id = %s
+      AND UPPER(status) NOT IN ('DONE', 'FAILED', 'CANCELLED')
+    ORDER BY created_ts DESC
+    LIMIT 1
+    """, (order_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row_to_mission(row)
+
 
 # =========================================================
 # SYSTEM
@@ -605,6 +620,86 @@ def list_users(authorization: Optional[str] = Header(default=None)):
 # =========================================================
 # ORDERS API
 # =========================================================
+@app.post("/orders/{order_id}/dispatch")
+def dispatch_order(order_id: str, authorization: Optional[str] = Header(default=None)):
+    admin = require_admin(authorization)
+    if isinstance(admin, dict) and admin.get("error"):
+        return admin
+
+    order = get_order_by_id(order_id)
+    if not order:
+        return {"error": "order_not_found"}
+
+    status_upper = str(order["status"]).upper()
+
+    if status_upper == "CANCELLED":
+        return {"error": "order_cancelled"}
+
+    if status_upper in ["DELIVERED", "COMPLETED", "DONE"]:
+        return {"error": "order_completed"}
+
+    existing_mission = get_active_mission_by_order_id(order_id)
+    if existing_mission:
+        return {"error": "mission_already_exists"}
+
+    drone = get_drone_by_id("drone_1")
+    if not drone:
+        return {"error": "drone_not_found"}
+
+    mid = f"mission_{int(time.time() * 1000)}"
+    drop = order["dropoff"]
+
+    mission = {
+        "id": mid,
+        "order_id": order_id,
+        "drone_id": "drone_1",
+        "status": "START_REQUESTED",
+        "altitude_m": 20.0,
+        "warehouse_lat": 10.850602,
+        "warehouse_lng": 106.771948,
+        "waypoints": [
+            {
+                "lat": drop["lat"],
+                "lng": drop["lng"],
+                "alt_m": 20.0
+            }
+        ],
+        "created_by": admin["username"],
+        "created_ts": now_ms()
+    }
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO missions (
+        id, order_id, drone_id, status, altitude_m,
+        warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        mission["id"],
+        mission["order_id"],
+        mission["drone_id"],
+        mission["status"],
+        mission["altitude_m"],
+        mission["warehouse_lat"],
+        mission["warehouse_lng"],
+        json.dumps(mission["waypoints"]),
+        mission["created_by"],
+        mission["created_ts"]
+    ))
+
+    cur.execute("""
+    UPDATE orders
+    SET status = %s
+    WHERE id = %s
+    """, ("ASSIGNED", order_id))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"ok": True, "mission": mission}
 
 @app.post("/orders")
 def create_order(req: CreateOrderReq, authorization: Optional[str] = Header(default=None)):
