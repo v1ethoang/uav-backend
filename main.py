@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional
 import time
 import uuid
 import sqlite3
@@ -30,7 +30,6 @@ async def add_process_time_header(request, call_next):
 # =========================================================
 
 DB_PATH = os.getenv("DB_PATH", "uav.db")
-TOKENS: Dict[str, str] = {}   # token -> username
 
 
 def now_ms():
@@ -61,6 +60,14 @@ def init_db():
         email TEXT DEFAULT '',
         phone TEXT DEFAULT '',
         address TEXT DEFAULT '',
+        created_ts INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
         created_ts INTEGER NOT NULL
     )
     """)
@@ -200,13 +207,14 @@ class UpdateProfileReq(BaseModel):
 class ChangePasswordReq(BaseModel):
     old_password: str
     new_password: str
+    confirm_new_password: str
 
 
 # =========================================================
 # DB HELPERS
 # =========================================================
 
-def row_to_user(row) -> Optional[dict]:
+def row_to_user(row):
     if not row:
         return None
     return {
@@ -222,7 +230,7 @@ def row_to_user(row) -> Optional[dict]:
     }
 
 
-def row_to_drone(row) -> Optional[dict]:
+def row_to_drone(row):
     if not row:
         return None
     last = json.loads(row["last"]) if row["last"] else None
@@ -235,7 +243,7 @@ def row_to_drone(row) -> Optional[dict]:
     }
 
 
-def row_to_order(row) -> Optional[dict]:
+def row_to_order(row):
     if not row:
         return None
     return {
@@ -248,7 +256,7 @@ def row_to_order(row) -> Optional[dict]:
     }
 
 
-def row_to_mission(row) -> Optional[dict]:
+def row_to_mission(row):
     if not row:
         return None
     return {
@@ -265,7 +273,7 @@ def row_to_mission(row) -> Optional[dict]:
     }
 
 
-def get_user_by_username(username: str) -> Optional[dict]:
+def get_user_by_username(username: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -274,7 +282,7 @@ def get_user_by_username(username: str) -> Optional[dict]:
     return row_to_user(row)
 
 
-def get_order_by_id(order_id: str) -> Optional[dict]:
+def get_order_by_id(order_id: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
@@ -283,7 +291,7 @@ def get_order_by_id(order_id: str) -> Optional[dict]:
     return row_to_order(row)
 
 
-def get_mission_by_id(mission_id: str) -> Optional[dict]:
+def get_mission_by_id(mission_id: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
@@ -292,7 +300,7 @@ def get_mission_by_id(mission_id: str) -> Optional[dict]:
     return row_to_mission(row)
 
 
-def get_drone_by_id(drone_id: str) -> Optional[dict]:
+def get_drone_by_id(drone_id: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM drones WHERE id = ?", (drone_id,))
@@ -313,11 +321,39 @@ def extract_token(authorization: Optional[str]) -> Optional[str]:
     return authorization.replace("Bearer ", "").strip()
 
 
+def save_session(token: str, username: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT OR REPLACE INTO sessions (token, username, created_ts)
+    VALUES (?, ?, ?)
+    """, (token, username, now_ms()))
+    conn.commit()
+    conn.close()
+
+
+def get_session_username(token: str) -> Optional[str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM sessions WHERE token = ?", (token,))
+    row = cur.fetchone()
+    conn.close()
+    return row["username"] if row else None
+
+
+def delete_session(token: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+
+
 def get_current_user(authorization: Optional[str]):
     token = extract_token(authorization)
     if not token:
         return None
-    username = TOKENS.get(token)
+    username = get_session_username(token)
     if not username:
         return None
     return get_user_by_username(username)
@@ -414,7 +450,7 @@ def login(req: LoginReq):
         return {"error": "invalid_credentials"}
 
     token = str(uuid.uuid4())
-    TOKENS[token] = username
+    save_session(token, username)
 
     return {
         "ok": True,
@@ -428,15 +464,14 @@ def auth_me(authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
     if isinstance(user, dict) and user.get("error"):
         return user
-
     return {"ok": True, "user": public_user(user)}
 
 
 @app.post("/auth/logout")
 def logout(authorization: Optional[str] = Header(default=None)):
     token = extract_token(authorization)
-    if token and token in TOKENS:
-        del TOKENS[token]
+    if token:
+        delete_session(token)
     return {"ok": True}
 
 
@@ -452,6 +487,9 @@ def change_password(req: ChangePasswordReq, authorization: Optional[str] = Heade
     if len(req.new_password) < 4:
         return {"error": "password_too_short"}
 
+    if req.new_password != req.confirm_new_password:
+        return {"error": "confirm_password_not_match"}
+
     if req.old_password == req.new_password:
         return {"error": "same_as_old_password"}
 
@@ -465,7 +503,7 @@ def change_password(req: ChangePasswordReq, authorization: Optional[str] = Heade
     conn.commit()
     conn.close()
 
-    return {"ok": True}
+    return {"ok": True, "message": "password_changed"}
 
 
 # =========================================================
