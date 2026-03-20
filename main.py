@@ -1,9 +1,13 @@
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List
 import time
 import uuid
+import sqlite3
+import json
+import hashlib
+import os
 
 app = FastAPI(title="Drone Delivery Backend (MVP)")
 
@@ -22,37 +26,116 @@ async def add_process_time_header(request, call_next):
 
 
 # =========================================================
-# IN-MEMORY DATA
+# CONFIG
 # =========================================================
+
+DB_PATH = os.getenv("DB_PATH", "uav.db")
+TOKENS: Dict[str, str] = {}   # token -> username
+
 
 def now_ms():
     return int(time.time() * 1000)
 
 
-DRONES: Dict[str, dict] = {
-    "drone_1": {
-        "id": "drone_1",
-        "name": "SITL-1",
-        "status": "IDLE",
-        "last": None,
-        "last_seen": None
-    }
-}
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-ORDERS: Dict[str, dict] = {}
-MISSIONS: Dict[str, dict] = {}
 
-USERS: Dict[str, dict] = {
-    "admin": {
-        "id": "user_admin",
-        "username": "admin",
-        "password": "admin123",
-        "role": "admin",
-        "created_ts": now_ms()
-    }
-}
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-TOKENS: Dict[str, str] = {}  # token -> username
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        full_name TEXT DEFAULT '',
+        email TEXT DEFAULT '',
+        phone TEXT DEFAULT '',
+        address TEXT DEFAULT '',
+        created_ts INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS drones (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        last TEXT,
+        last_seen INTEGER
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        created_by TEXT NOT NULL,
+        dropoff TEXT NOT NULL,
+        note TEXT,
+        status TEXT NOT NULL,
+        created_ts INTEGER NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS missions (
+        id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        drone_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        altitude_m REAL NOT NULL,
+        warehouse_lat REAL NOT NULL,
+        warehouse_lng REAL NOT NULL,
+        waypoints TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_ts INTEGER NOT NULL
+    )
+    """)
+
+    # Seed admin
+    cur.execute("SELECT username FROM users WHERE username = ?", ("admin",))
+    if not cur.fetchone():
+        cur.execute("""
+        INSERT INTO users (
+            id, username, password_hash, role,
+            full_name, email, phone, address, created_ts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "user_admin",
+            "admin",
+            hash_password("admin123"),
+            "admin",
+            "Administrator",
+            "",
+            "",
+            "",
+            now_ms()
+        ))
+
+    # Seed drone
+    cur.execute("SELECT id FROM drones WHERE id = ?", ("drone_1",))
+    if not cur.fetchone():
+        cur.execute("""
+        INSERT INTO drones (id, name, status, last, last_seen)
+        VALUES (?, ?, ?, ?, ?)
+        """, ("drone_1", "SITL-1", "IDLE", None, None))
+
+    conn.commit()
+    conn.close()
+
+
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
 # =========================================================
@@ -107,6 +190,117 @@ class LoginReq(BaseModel):
     password: str
 
 
+class UpdateProfileReq(BaseModel):
+    full_name: Optional[str] = ""
+    email: Optional[str] = ""
+    phone: Optional[str] = ""
+    address: Optional[str] = ""
+
+
+class ChangePasswordReq(BaseModel):
+    old_password: str
+    new_password: str
+
+
+# =========================================================
+# DB HELPERS
+# =========================================================
+
+def row_to_user(row) -> Optional[dict]:
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "password_hash": row["password_hash"],
+        "role": row["role"],
+        "full_name": row["full_name"] or "",
+        "email": row["email"] or "",
+        "phone": row["phone"] or "",
+        "address": row["address"] or "",
+        "created_ts": row["created_ts"]
+    }
+
+
+def row_to_drone(row) -> Optional[dict]:
+    if not row:
+        return None
+    last = json.loads(row["last"]) if row["last"] else None
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "status": row["status"],
+        "last": last,
+        "last_seen": row["last_seen"]
+    }
+
+
+def row_to_order(row) -> Optional[dict]:
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "created_by": row["created_by"],
+        "dropoff": json.loads(row["dropoff"]),
+        "note": row["note"],
+        "status": row["status"],
+        "created_ts": row["created_ts"]
+    }
+
+
+def row_to_mission(row) -> Optional[dict]:
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "order_id": row["order_id"],
+        "drone_id": row["drone_id"],
+        "status": row["status"],
+        "altitude_m": row["altitude_m"],
+        "warehouse_lat": row["warehouse_lat"],
+        "warehouse_lng": row["warehouse_lng"],
+        "waypoints": json.loads(row["waypoints"]),
+        "created_by": row["created_by"],
+        "created_ts": row["created_ts"]
+    }
+
+
+def get_user_by_username(username: str) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_user(row)
+
+
+def get_order_by_id(order_id: str) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE id = ?", (order_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_order(row)
+
+
+def get_mission_by_id(mission_id: str) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM missions WHERE id = ?", (mission_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_mission(row)
+
+
+def get_drone_by_id(drone_id: str) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM drones WHERE id = ?", (drone_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_drone(row)
+
+
 # =========================================================
 # AUTH HELPERS
 # =========================================================
@@ -126,7 +320,7 @@ def get_current_user(authorization: Optional[str]):
     username = TOKENS.get(token)
     if not username:
         return None
-    return USERS.get(username)
+    return get_user_by_username(username)
 
 
 def require_user(authorization: Optional[str]):
@@ -143,6 +337,19 @@ def require_admin(authorization: Optional[str]):
     if user["role"] != "admin":
         return {"error": "forbidden"}
     return user
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "role": user["role"],
+        "full_name": user.get("full_name", ""),
+        "email": user.get("email", ""),
+        "phone": user.get("phone", ""),
+        "address": user.get("address", ""),
+        "created_ts": user.get("created_ts")
+    }
 
 
 # =========================================================
@@ -168,28 +375,42 @@ def register(req: RegisterReq):
     if len(req.password) < 4:
         return {"error": "password_too_short"}
 
-    if username in USERS:
+    if get_user_by_username(username):
         return {"error": "username_exists"}
 
-    uid = f"user_{len(USERS) + 1}"
+    uid = f"user_{uuid.uuid4().hex[:10]}"
 
-    USERS[username] = {
-        "id": uid,
-        "username": username,
-        "password": req.password,
-        "role": "user",
-        "created_ts": now_ms()
-    }
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO users (
+        id, username, password_hash, role,
+        full_name, email, phone, address, created_ts
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        uid,
+        username,
+        hash_password(req.password),
+        "user",
+        "",
+        "",
+        "",
+        "",
+        now_ms()
+    ))
+    conn.commit()
+    conn.close()
 
-    return {"ok": True, "user": {"id": uid, "username": username, "role": "user"}}
+    user = get_user_by_username(username)
+    return {"ok": True, "user": public_user(user)}
 
 
 @app.post("/auth/login")
 def login(req: LoginReq):
     username = req.username.strip()
-    user = USERS.get(username)
+    user = get_user_by_username(username)
 
-    if not user or user["password"] != req.password:
+    if not user or user["password_hash"] != hash_password(req.password):
         return {"error": "invalid_credentials"}
 
     token = str(uuid.uuid4())
@@ -198,11 +419,7 @@ def login(req: LoginReq):
     return {
         "ok": True,
         "token": token,
-        "user": {
-            "id": user["id"],
-            "username": user["username"],
-            "role": user["role"]
-        }
+        "user": public_user(user)
     }
 
 
@@ -212,14 +429,7 @@ def auth_me(authorization: Optional[str] = Header(default=None)):
     if isinstance(user, dict) and user.get("error"):
         return user
 
-    return {
-        "ok": True,
-        "user": {
-            "id": user["id"],
-            "username": user["username"],
-            "role": user["role"]
-        }
-    }
+    return {"ok": True, "user": public_user(user)}
 
 
 @app.post("/auth/logout")
@@ -230,8 +440,81 @@ def logout(authorization: Optional[str] = Header(default=None)):
     return {"ok": True}
 
 
+@app.put("/auth/change-password")
+def change_password(req: ChangePasswordReq, authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    if isinstance(user, dict) and user.get("error"):
+        return user
+
+    if hash_password(req.old_password) != user["password_hash"]:
+        return {"error": "wrong_old_password"}
+
+    if len(req.new_password) < 4:
+        return {"error": "password_too_short"}
+
+    if req.old_password == req.new_password:
+        return {"error": "same_as_old_password"}
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE users
+    SET password_hash = ?
+    WHERE username = ?
+    """, (hash_password(req.new_password), user["username"]))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+
+
 # =========================================================
-# USER API
+# USER PROFILE API
+# =========================================================
+
+@app.put("/users/me")
+def update_me(req: UpdateProfileReq, authorization: Optional[str] = Header(default=None)):
+    user = require_user(authorization)
+    if isinstance(user, dict) and user.get("error"):
+        return user
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE users
+    SET full_name = ?, email = ?, phone = ?, address = ?
+    WHERE username = ?
+    """, (
+        (req.full_name or "").strip(),
+        (req.email or "").strip(),
+        (req.phone or "").strip(),
+        (req.address or "").strip(),
+        user["username"]
+    ))
+    conn.commit()
+    conn.close()
+
+    updated = get_user_by_username(user["username"])
+    return {"ok": True, "user": public_user(updated)}
+
+
+@app.get("/users")
+def list_users(authorization: Optional[str] = Header(default=None)):
+    admin = require_admin(authorization)
+    if isinstance(admin, dict) and admin.get("error"):
+        return admin
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users ORDER BY created_ts DESC")
+    rows = cur.fetchall()
+    conn.close()
+
+    return [public_user(row_to_user(r)) for r in rows]
+
+
+# =========================================================
+# ORDERS API
 # =========================================================
 
 @app.post("/orders")
@@ -240,9 +523,9 @@ def create_order(req: CreateOrderReq, authorization: Optional[str] = Header(defa
     if isinstance(user, dict) and user.get("error"):
         return user
 
-    oid = f"order_{len(ORDERS)+1}"
+    oid = f"order_{uuid.uuid4().hex[:10]}"
 
-    ORDERS[oid] = {
+    order = {
         "id": oid,
         "created_by": user["username"],
         "dropoff": req.dropoff.model_dump(),
@@ -251,7 +534,23 @@ def create_order(req: CreateOrderReq, authorization: Optional[str] = Header(defa
         "created_ts": now_ms()
     }
 
-    return ORDERS[oid]
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    INSERT INTO orders (id, created_by, dropoff, note, status, created_ts)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        order["id"],
+        order["created_by"],
+        json.dumps(order["dropoff"]),
+        order["note"],
+        order["status"],
+        order["created_ts"]
+    ))
+    conn.commit()
+    conn.close()
+
+    return order
 
 
 @app.get("/orders")
@@ -260,14 +559,26 @@ def list_orders(authorization: Optional[str] = Header(default=None)):
     if isinstance(user, dict) and user.get("error"):
         return user
 
-    if user["role"] == "admin":
-        return list(ORDERS.values())
+    conn = get_conn()
+    cur = conn.cursor()
 
-    return [o for o in ORDERS.values() if o.get("created_by") == user["username"]]
+    if user["role"] == "admin":
+        cur.execute("SELECT * FROM orders ORDER BY created_ts DESC")
+    else:
+        cur.execute("""
+        SELECT * FROM orders
+        WHERE created_by = ?
+        ORDER BY created_ts DESC
+        """, (user["username"],))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return [row_to_order(r) for r in rows]
 
 
 # =========================================================
-# OPERATOR / ADMIN API
+# MISSIONS API
 # =========================================================
 
 @app.post("/missions")
@@ -276,15 +587,15 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
     if isinstance(admin, dict) and admin.get("error"):
         return admin
 
-    if req.order_id not in ORDERS:
+    order = get_order_by_id(req.order_id)
+    if not order:
         return {"error": "order_not_found"}
 
-    if req.drone_id not in DRONES:
+    drone = get_drone_by_id(req.drone_id)
+    if not drone:
         return {"error": "drone_not_found"}
 
-    mid = f"mission_{len(MISSIONS)+1}"
-
-    order = ORDERS[req.order_id]
+    mid = f"mission_{uuid.uuid4().hex[:10]}"
     drop = order["dropoff"]
 
     waypoints = [
@@ -295,11 +606,11 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
         }
     ]
 
-    MISSIONS[mid] = {
+    mission = {
         "id": mid,
         "order_id": req.order_id,
         "drone_id": req.drone_id,
-        "status": "START_REQUESTED",
+        "status": "ASSIGNED",
         "altitude_m": req.altitude_m,
         "warehouse_lat": req.warehouse_lat,
         "warehouse_lng": req.warehouse_lng,
@@ -308,9 +619,37 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
         "created_ts": now_ms()
     }
 
-    ORDERS[req.order_id]["status"] = "QUEUED"
+    conn = get_conn()
+    cur = conn.cursor()
 
-    return MISSIONS[mid]
+    cur.execute("""
+    INSERT INTO missions (
+        id, order_id, drone_id, status, altitude_m,
+        warehouse_lat, warehouse_lng, waypoints, created_by, created_ts
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        mission["id"],
+        mission["order_id"],
+        mission["drone_id"],
+        mission["status"],
+        mission["altitude_m"],
+        mission["warehouse_lat"],
+        mission["warehouse_lng"],
+        json.dumps(mission["waypoints"]),
+        mission["created_by"],
+        mission["created_ts"]
+    ))
+
+    cur.execute("""
+    UPDATE orders
+    SET status = ?
+    WHERE id = ?
+    """, ("QUEUED", req.order_id))
+
+    conn.commit()
+    conn.close()
+
+    return mission
 
 
 @app.post("/missions/{mission_id}/start")
@@ -319,12 +658,27 @@ def start_mission(mission_id: str, authorization: Optional[str] = Header(default
     if isinstance(admin, dict) and admin.get("error"):
         return admin
 
-    if mission_id not in MISSIONS:
+    mission = get_mission_by_id(mission_id)
+    if not mission:
         return {"error": "mission_not_found"}
 
-    MISSIONS[mission_id]["status"] = "START_REQUESTED"
-    order_id = MISSIONS[mission_id]["order_id"]
-    ORDERS[order_id]["status"] = "ASSIGNED"
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    UPDATE missions
+    SET status = ?
+    WHERE id = ?
+    """, ("START_REQUESTED", mission_id))
+
+    cur.execute("""
+    UPDATE orders
+    SET status = ?
+    WHERE id = ?
+    """, ("ASSIGNED", mission["order_id"]))
+
+    conn.commit()
+    conn.close()
 
     return {"ok": True}
 
@@ -335,28 +689,24 @@ def list_missions(authorization: Optional[str] = Header(default=None)):
     if isinstance(user, dict) and user.get("error"):
         return user
 
+    conn = get_conn()
+    cur = conn.cursor()
+
     if user["role"] == "admin":
-        return list(MISSIONS.values())
+        cur.execute("SELECT * FROM missions ORDER BY created_ts DESC")
+        rows = cur.fetchall()
+    else:
+        cur.execute("""
+        SELECT m.*
+        FROM missions m
+        JOIN orders o ON m.order_id = o.id
+        WHERE o.created_by = ?
+        ORDER BY m.created_ts DESC
+        """, (user["username"],))
+        rows = cur.fetchall()
 
-    my_order_ids = {o["id"] for o in ORDERS.values() if o.get("created_by") == user["username"]}
-    return [m for m in MISSIONS.values() if m["order_id"] in my_order_ids]
-
-
-@app.get("/users")
-def list_users(authorization: Optional[str] = Header(default=None)):
-    admin = require_admin(authorization)
-    if isinstance(admin, dict) and admin.get("error"):
-        return admin
-
-    return [
-        {
-            "id": u["id"],
-            "username": u["username"],
-            "role": u["role"],
-            "created_ts": u["created_ts"]
-        }
-        for u in USERS.values()
-    ]
+    conn.close()
+    return [row_to_mission(r) for r in rows]
 
 
 # =========================================================
@@ -365,83 +715,126 @@ def list_users(authorization: Optional[str] = Header(default=None)):
 
 @app.get("/bridge/missions/next")
 def bridge_next_mission(drone_id: str):
-    for m in MISSIONS.values():
-        if m["drone_id"] == drone_id and m["status"] == "START_REQUESTED":
-            m["status"] = "RUNNING"
+    conn = get_conn()
+    cur = conn.cursor()
 
-            order_id = m["order_id"]
-            ORDERS[order_id]["status"] = "IN_FLIGHT"
+    cur.execute("""
+    SELECT * FROM missions
+    WHERE drone_id = ? AND status = ?
+    ORDER BY created_ts ASC
+    LIMIT 1
+    """, (drone_id, "START_REQUESTED"))
 
-            return {"mission": m}
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return {"mission": None}
 
-    return {"mission": None}
+    mission = row_to_mission(row)
+
+    cur.execute("""
+    UPDATE missions
+    SET status = ?
+    WHERE id = ?
+    """, ("RUNNING", mission["id"]))
+
+    cur.execute("""
+    UPDATE orders
+    SET status = ?
+    WHERE id = ?
+    """, ("IN_FLIGHT", mission["order_id"]))
+
+    conn.commit()
+    conn.close()
+
+    updated = get_mission_by_id(mission["id"])
+    return {"mission": updated}
 
 
 @app.post("/bridge/telemetry")
 def bridge_telemetry(req: TelemetryReq):
-    if req.drone_id in DRONES:
-        DRONES[req.drone_id]["last_seen"] = now_ms()
-        DRONES[req.drone_id]["last"] = {
-            "lat": req.lat,
-            "lng": req.lng,
-            "alt_m": req.alt_m,
-            "groundspeed_mps": req.groundspeed_mps,
-            "battery_percent": req.battery_percent,
-            "mode": req.mode,
-            "armed": req.armed,
-            "ts_ms": req.ts_ms
-        }
+    drone = get_drone_by_id(req.drone_id)
+    if not drone:
+        return {"error": "drone_not_found"}
 
-        if req.mode in ["GUIDED", "AUTO", "MISSION", "LAND"]:
-            DRONES[req.drone_id]["status"] = "BUSY"
-        elif req.armed:
-            DRONES[req.drone_id]["status"] = "BUSY"
-        else:
-            DRONES[req.drone_id]["status"] = "IDLE"
+    last_data = {
+        "lat": req.lat,
+        "lng": req.lng,
+        "alt_m": req.alt_m,
+        "groundspeed_mps": req.groundspeed_mps,
+        "battery_percent": req.battery_percent,
+        "mode": req.mode,
+        "armed": req.armed,
+        "ts_ms": req.ts_ms
+    }
+
+    if req.mode in ["GUIDED", "AUTO", "MISSION", "LAND"]:
+        status = "BUSY"
+    elif req.armed:
+        status = "BUSY"
+    else:
+        status = "IDLE"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+    UPDATE drones
+    SET status = ?, last = ?, last_seen = ?
+    WHERE id = ?
+    """, (status, json.dumps(last_data), now_ms(), req.drone_id))
+    conn.commit()
+    conn.close()
 
     return {"ok": True}
 
 
 @app.post("/bridge/event")
 def bridge_event(req: EventReq):
-    m = MISSIONS.get(req.mission_id)
-
-    if not m:
+    mission = get_mission_by_id(req.mission_id)
+    if not mission:
         return {"ok": False, "error": "mission_not_found"}
 
-    oid = m["order_id"]
+    conn = get_conn()
+    cur = conn.cursor()
 
     if req.type == "ARRIVED":
-        ORDERS[oid]["status"] = "ARRIVED"
+        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("ARRIVED", mission["order_id"]))
 
     elif req.type == "DELIVERED":
-        ORDERS[oid]["status"] = "DELIVERED"
+        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("DELIVERED", mission["order_id"]))
 
     elif req.type == "COMPLETED":
-        ORDERS[oid]["status"] = "COMPLETED"
-        m["status"] = "DONE"
+        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("COMPLETED", mission["order_id"]))
+        cur.execute("UPDATE missions SET status = ? WHERE id = ?", ("DONE", req.mission_id))
 
     elif req.type == "FAILED":
-        ORDERS[oid]["status"] = "FAILED"
-        m["status"] = "FAILED"
+        cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("FAILED", mission["order_id"]))
+        cur.execute("UPDATE missions SET status = ? WHERE id = ?", ("FAILED", req.mission_id))
+
+    conn.commit()
+    conn.close()
 
     return {"ok": True}
 
 
 @app.post("/bridge/missions/{mission_id}/complete")
 def complete_mission(mission_id: str):
-    if mission_id not in MISSIONS:
+    mission = get_mission_by_id(mission_id)
+    if not mission:
         return {"error": "mission_not_found"}
 
-    MISSIONS[mission_id]["status"] = "DONE"
-    oid = MISSIONS[mission_id]["order_id"]
-    ORDERS[oid]["status"] = "COMPLETED"
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE missions SET status = ? WHERE id = ?", ("DONE", mission_id))
+    cur.execute("UPDATE orders SET status = ? WHERE id = ?", ("COMPLETED", mission["order_id"]))
+    conn.commit()
+    conn.close()
 
     return {"ok": True}
 
 
 # =========================================================
-# DRONES
+# DRONES API
 # =========================================================
 
 @app.get("/drones")
@@ -450,13 +843,20 @@ def list_drones(authorization: Optional[str] = Header(default=None)):
     if isinstance(user, dict) and user.get("error"):
         return user
 
-    return list(DRONES.values())
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM drones ORDER BY id ASC")
+    rows = cur.fetchall()
+    conn.close()
+
+    return [row_to_drone(r) for r in rows]
 
 
 @app.get("/drones/{drone_id}")
-def get_drone(drone_id: str, authorization: Optional[str] = Header(default=None)):
+def get_drone_api(drone_id: str, authorization: Optional[str] = Header(default=None)):
     user = require_user(authorization)
     if isinstance(user, dict) and user.get("error"):
         return user
 
-    return DRONES.get(drone_id, {"error": "drone_not_found"})
+    drone = get_drone_by_id(drone_id)
+    return drone or {"error": "drone_not_found"}
