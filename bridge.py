@@ -10,7 +10,7 @@ from pymavlink import mavutil
 # CONFIG
 # =========================================================
 
-BACKEND = "http://127.0.0.1:8080"   # đổi nếu backend chạy chỗ khác
+BACKEND = "https://uav-backend-zbti.onrender.com"   # đổi nếu backend chạy chỗ khác
 DRONE_ID = "drone_1"
 CONNECTION = "127.0.0.1:14552"
 

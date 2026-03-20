@@ -449,6 +449,23 @@ def get_active_mission_by_order_id(order_id: str):
     conn.close()
     return row_to_mission(row)
 
+def get_next_mission_id():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM 9) AS INTEGER)), 0) AS max_num
+    FROM missions
+    WHERE id ~ '^mission_[0-9]+$'
+    """)
+
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    max_num = int(row["max_num"] or 0)
+    return f"mission_{max_num + 1}"
+
 
 # =========================================================
 # SYSTEM
