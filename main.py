@@ -334,28 +334,18 @@ def get_drone_by_id(drone_id: str):
 def get_next_order_id():
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
-    SELECT id
+    SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM 7) AS INTEGER)), 0) AS max_num
     FROM orders
-    WHERE id LIKE 'order_%'
-    ORDER BY created_ts DESC
-    LIMIT 500
+    WHERE id ~ '^order_[0-9]+$'
     """)
-    rows = cur.fetchall()
+
+    row = cur.fetchone()
     cur.close()
     conn.close()
 
-    max_num = 0
-    for row in rows:
-        oid = str(row["id"])
-        if not oid.startswith("order_"):
-            continue
-        suffix = oid.replace("order_", "", 1)
-        if suffix.isdigit():
-            n = int(suffix)
-            if n > max_num:
-                max_num = n
-
+    max_num = int(row["max_num"] or 0)
     return f"order_{max_num + 1}"
 
 
