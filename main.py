@@ -663,7 +663,7 @@ def dispatch_order(order_id: str, authorization: Optional[str] = Header(default=
     if not drone:
         return {"error": "drone_not_found"}
 
-    mid = f"mission_{int(time.time() * 1000)}"
+    mid = get_next_mission_id()
     drop = order["dropoff"]
 
     mission = {
@@ -846,7 +846,7 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
     if not drone:
         return {"error": "drone_not_found"}
 
-    mid = f"mission_{int(time.time() * 1000)}"
+    mid = get_next_mission_id()
     drop = order["dropoff"]
 
     waypoints = [
