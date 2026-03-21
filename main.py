@@ -8,6 +8,7 @@ import hashlib
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import secrets
 
 
 app = FastAPI(title="Drone Delivery Backend")
@@ -516,7 +517,7 @@ def login(req: LoginReq):
     if not user or user["password_hash"] != hash_password(req.password):
         return {"error": "invalid_credentials"}
 
-    token = f"tok_{int(time.time())}_{username}"
+    token = secrets.token_hex(32)
     save_session(token, username)
 
     return {
