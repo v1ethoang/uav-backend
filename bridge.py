@@ -533,12 +533,12 @@ def setup_vehicle_params(vehicle):
     log("Setting flight parameters...")
 
     params = {
-        "WP_SPD": 1000,
-        "WP_ACC": 700,
-        "WP_ACC_Z": 250,
-        "WP_SPD_UP": 350,
-        "WP_SPD_DN": 250,
-        "WP_RADIUS_M": 100
+        "WP_SPD": 15,
+        "WP_ACC": 3,
+        "WP_ACC_Z": 2.5,
+        "WP_SPD_UP": 5,
+        "WP_SPD_DN": 5,
+        "WP_RADIUS_M": 5
     }
 
     for k, v in params.items():
