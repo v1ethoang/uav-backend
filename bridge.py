@@ -10,7 +10,7 @@ from pymavlink import mavutil
 # CONFIG
 # =========================================================
 
-BACKEND = "https://uav-backend-zbti.onrender.com"   # đổi nếu backend chạy chỗ khác
+BACKEND = "https://uav-backend-zbti.onrender.com"
 DRONE_ID = "drone_1"
 CONNECTION = "127.0.0.1:14552"
 
@@ -19,25 +19,20 @@ TELEMETRY_TIMEOUT = 1.0
 EVENT_TIMEOUT = 2.0
 REQUEST_TIMEOUT = 8.0
 
-
 # ==============================
-# FLIGHT TUNING
+# FLIGHT PROFILE
 # ==============================
-MIN_CRUISE_SPEED = 3.0
-MAX_CRUISE_SPEED = 10.0
-APPROACH_MIN_SPEED = 1.8
-DESCEND_SPEED = 1.8
-RETURN_MAX_SPEED = 8.0
-
-WAYPOINT_RADIUS = 1.0
+WAYPOINT_RADIUS = 1.2
 ALT_TOLERANCE = 0.8
 DELIVERY_ALT = 6.0
 HOME_LAND_ALT = 4.0
-DELIVERY_HOLD_SEC = 0.3
 GOTO_TIMEOUT = 180
-
-APPROACH_BRAKE_DISTANCE = 3.0
 GOTO_LOG_PERIOD = 1.0
+
+TAKEOFF_HOVER_SEC = 5.0
+POST_DELIVERY_HOVER_SEC = 5.0
+PRE_DROP_HOVER_SEC = 2.0
+PRE_HOME_DESCEND_HOVER_SEC = 3.0
 
 
 # =========================================================
@@ -77,33 +72,78 @@ def get_distance(a, b):
     return 2.0 * R * math.asin(math.sqrt(h))
 
 
-def clamp_speed(speed_mps, max_speed):
-    return max(0.8, min(speed_mps, max_speed))
+def hover_and_report(vehicle, hold_sec, label="Hover"):
+    log(f"{label} {hold_sec:.1f}s")
+    start = time.time()
+    while time.time() - start < hold_sec:
+        send_telemetry(vehicle)
+        time.sleep(0.5)
 
 
-def compute_cruise_speed_by_distance(distance_m):
-    if distance_m >= 200:
-        return 10.0
+def get_wp_speed_by_distance(distance_m):
+    """
+    WP_SPD theo khoảng cách.
+    Theo yêu cầu của m: dùng đơn vị m/s.
+    """
+    if distance_m >= 300:
+        return 15.0
+    elif distance_m >= 200:
+        return 12.0
     elif distance_m >= 120:
-        return 8.0
+        return 9.0
     elif distance_m >= 60:
-        return 6.0
-    elif distance_m >= 25:
-        return 4.5
+        return 7.0
+    elif distance_m >= 30:
+        return 5.0
     else:
-        return MIN_CRUISE_SPEED
+        return 3.5
 
 
-def compute_approach_speed(remaining_dist, cruise_speed):
-    if remaining_dist <= APPROACH_BRAKE_DISTANCE:
-        return APPROACH_MIN_SPEED
-    return cruise_speed
+def write_param_and_confirm(vehicle, name, value, retries=3, wait_sec=0.6):
+    last_err = None
+
+    for _ in range(retries):
+        try:
+            vehicle.parameters[name] = value
+            time.sleep(wait_sec)
+
+            read_back = vehicle.parameters[name]
+            if abs(float(read_back) - float(value)) < 0.01:
+                log(f"Set {name} = {read_back}")
+                return True
+
+            log(f"Param {name} mismatch: want={value}, got={read_back}")
+        except Exception as e:
+            last_err = e
+            log(f"Set param failed {name}={value}: {e}")
+
+        time.sleep(0.4)
+
+    if last_err:
+        raise Exception(f"write_param_failed_{name}: {last_err}")
+    raise Exception(f"write_param_failed_{name}")
 
 
-def set_vehicle_speed(vehicle, speed_mps, max_speed=MAX_CRUISE_SPEED):
-    speed_mps = clamp_speed(speed_mps, max_speed)
-    vehicle.groundspeed = speed_mps
-    return speed_mps
+def apply_horizontal_profile(vehicle, distance_m):
+    """
+    Bay ngang tới waypoint.
+    """
+    wp_spd = get_wp_speed_by_distance(distance_m)
+
+    log(f"Apply horizontal profile | dist={distance_m:.2f}m | WP_SPD={wp_spd:.2f} m/s")
+    write_param_and_confirm(vehicle, "WP_SPD", wp_spd)
+    write_param_and_confirm(vehicle, "WP_ACC", 1.8)
+    write_param_and_confirm(vehicle, "WP_RADIUS_M", 3.0)
+
+
+def apply_vertical_profile(vehicle):
+    """
+    Lên/xuống mềm hơn để đỡ chao.
+    """
+    log("Apply vertical profile")
+    write_param_and_confirm(vehicle, "WP_SPD_UP", 2.5)
+    write_param_and_confirm(vehicle, "WP_SPD_DN", 1.8)
+    write_param_and_confirm(vehicle, "WP_ACC_Z", 1.8)
 
 
 def ensure_home(vehicle, wait_sec=20):
@@ -232,6 +272,8 @@ def arm_takeoff(vehicle, alt):
         send_telemetry(vehicle)
         time.sleep(0.5)
 
+    apply_vertical_profile(vehicle)
+
     log("Arming...")
     vehicle.armed = True
     while not vehicle.armed:
@@ -246,31 +288,29 @@ def arm_takeoff(vehicle, alt):
         raise Exception("takeoff_alt_timeout")
 
     log("Altitude reached")
+    hover_and_report(vehicle, TAKEOFF_HOVER_SEC, "Hover stabilize after takeoff")
 
 
 # =========================================================
 # GOTO
 # =========================================================
 
-def goto(vehicle, lat, lon, alt, base_speed=None, timeout=GOTO_TIMEOUT, max_speed=MAX_CRUISE_SPEED):
+def goto(vehicle, lat, lon, alt, timeout=GOTO_TIMEOUT, is_vertical=False):
     wp = LocationGlobalRelative(lat, lon, alt)
 
     current = vehicle.location.global_relative_frame
     initial_dist = get_distance(current, wp)
 
-    if base_speed is None:
-        cruise_speed = compute_cruise_speed_by_distance(initial_dist)
+    if is_vertical:
+        apply_vertical_profile(vehicle)
     else:
-        cruise_speed = base_speed
-
-    cruise_speed = clamp_speed(cruise_speed, max_speed)
+        apply_horizontal_profile(vehicle, initial_dist)
 
     log(
         f"GOTO lat={lat:.6f}, lon={lon:.6f}, alt={alt:.2f}, "
-        f"dist={initial_dist:.2f}m, cruise={cruise_speed:.2f}m/s"
+        f"dist={initial_dist:.2f}m, vertical={is_vertical}"
     )
 
-    current_cmd_speed = set_vehicle_speed(vehicle, cruise_speed, max_speed=max_speed)
     vehicle.simple_goto(wp)
 
     start = time.time()
@@ -285,17 +325,10 @@ def goto(vehicle, lat, lon, alt, base_speed=None, timeout=GOTO_TIMEOUT, max_spee
         alt_err = abs(alt_now - alt)
         actual_speed = float(vehicle.groundspeed or 0.0)
 
-        target_speed = compute_approach_speed(dist, cruise_speed)
-        target_speed = clamp_speed(target_speed, max_speed)
-
-        if abs(target_speed - current_cmd_speed) >= 0.2:
-            current_cmd_speed = set_vehicle_speed(vehicle, target_speed, max_speed=max_speed)
-            log(f"Speed update -> target_speed={current_cmd_speed:.2f} m/s")
-
         if now - last_print >= GOTO_LOG_PERIOD:
             log(
                 f"GOTO dist={dist:.2f}m alt={alt_now:.2f}m alt_err={alt_err:.2f}m "
-                f"target_speed={current_cmd_speed:.2f}m/s actual_speed={actual_speed:.2f}m/s"
+                f"actual_speed={actual_speed:.2f}m/s"
             )
             last_print = now
 
@@ -351,7 +384,7 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
     lon = float(wp["lng"])
 
     log("Fly to delivery point")
-    ok = goto(vehicle, lat, lon, cruise_alt)
+    ok = goto(vehicle, lat, lon, cruise_alt, timeout=GOTO_TIMEOUT, is_vertical=False)
     if not ok:
         raise Exception("goto_delivery_timeout")
 
@@ -363,15 +396,13 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
         lat,
         lon,
         DELIVERY_ALT,
-        base_speed=DESCEND_SPEED,
         timeout=90,
-        max_speed=DESCEND_SPEED
+        is_vertical=True
     )
     if not ok:
         raise Exception("descend_delivery_timeout")
 
-    log("Brief stabilize")
-    time.sleep(DELIVERY_HOLD_SEC)
+    hover_and_report(vehicle, PRE_DROP_HOVER_SEC, "Stabilize before drop")
 
     log("Drop payload now")
     payload_drop(vehicle)
@@ -383,12 +414,13 @@ def deliver(vehicle, wp, cruise_alt, mission_id):
         lat,
         lon,
         cruise_alt,
-        base_speed=2.5,
         timeout=90,
-        max_speed=3.0
+        is_vertical=True
     )
     if not ok:
         raise Exception("climb_after_drop_timeout")
+
+    hover_and_report(vehicle, POST_DELIVERY_HOVER_SEC, "Hover stabilize before return")
 
 
 # =========================================================
@@ -406,12 +438,13 @@ def return_home(vehicle, cruise_alt, mission_id):
         home.lat,
         home.lon,
         cruise_alt,
-        base_speed=RETURN_MAX_SPEED,
         timeout=GOTO_TIMEOUT,
-        max_speed=RETURN_MAX_SPEED
+        is_vertical=False
     )
     if not ok:
         raise Exception("return_home_timeout")
+
+    hover_and_report(vehicle, PRE_HOME_DESCEND_HOVER_SEC, "Hover over home before descend")
 
     log("Descend near home by GPS")
     ok = goto(
@@ -419,9 +452,8 @@ def return_home(vehicle, cruise_alt, mission_id):
         home.lat,
         home.lon,
         HOME_LAND_ALT,
-        base_speed=1.8,
         timeout=120,
-        max_speed=2.2
+        is_vertical=True
     )
     if not ok:
         raise Exception("home_descend_timeout")
@@ -530,15 +562,14 @@ def mission_loop(vehicle):
 # =========================================================
 
 def setup_vehicle_params(vehicle):
-    log("Setting flight parameters...")
+    log("Setting base flight parameters...")
 
     params = {
-        "WP_SPD": 15,
-        "WP_ACC": 3,
-        "WP_ACC_Z": 2.5,
-        "WP_SPD_UP": 5,
-        "WP_SPD_DN": 5,
-        "WP_RADIUS_M": 5
+        "WP_ACC": 1.8,
+        "WP_ACC_Z": 1.8,
+        "WP_SPD_UP": 2.5,
+        "WP_SPD_DN": 1.8,
+        "WP_RADIUS_M": 3.0
     }
 
     for k, v in params.items():
