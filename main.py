@@ -56,6 +56,72 @@ def compute_live_status(base_status: str, last_seen: Optional[int]):
 
     return base_status, age_ms
 
+def compute_status_from_last(last: Optional[dict]) -> str:
+    if not last:
+        return "OFFLINE"
+
+    mode = str(last.get("mode") or "").upper()
+    armed = bool(last.get("armed"))
+
+    if mode in ["GUIDED", "AUTO", "MISSION", "LAND", "RTL"]:
+        return "BUSY"
+
+    if armed:
+        return "BUSY"
+
+    return "IDLE"
+
+
+def build_source_state(last_json: Optional[str], last_seen: Optional[int], source_name: str):
+    last = json.loads(last_json) if last_json else None
+    base_status = compute_status_from_last(last)
+    live_status, age_ms = compute_live_status(base_status, last_seen)
+
+    return {
+        "source": source_name,
+        "last": last,
+        "last_seen": last_seen,
+        "status": live_status,
+        "base_status": base_status,
+        "age_ms": age_ms
+    }
+
+
+def resolve_effective_source(pi_state: dict, ground_state: dict, primary_source: str = "pi_bridge"):
+    primary = pi_state if primary_source == "pi_bridge" else ground_state
+    fallback = ground_state if primary_source == "pi_bridge" else pi_state
+
+    primary_fresh = primary["age_ms"] is not None and primary["age_ms"] <= STALE_AFTER_MS
+    fallback_fresh = fallback["age_ms"] is not None and fallback["age_ms"] <= STALE_AFTER_MS
+
+    primary_alive = primary["age_ms"] is not None and primary["age_ms"] <= OFFLINE_AFTER_MS
+    fallback_alive = fallback["age_ms"] is not None and fallback["age_ms"] <= OFFLINE_AFTER_MS
+
+    if primary_fresh:
+        return primary, "primary_fresh"
+
+    if fallback_fresh:
+        return fallback, "fallback_fresh"
+
+    if primary_alive and fallback_alive:
+        if (primary["age_ms"] or 10**18) <= (fallback["age_ms"] or 10**18):
+            return primary, "primary_stale_newer"
+        return fallback, "fallback_stale_newer"
+
+    if primary_alive:
+        return primary, "primary_stale_keep"
+
+    if fallback_alive:
+        return fallback, "fallback_stale_keep"
+
+    return {
+        "source": primary_source,
+        "last": None,
+        "last_seen": None,
+        "status": "OFFLINE",
+        "base_status": "OFFLINE",
+        "age_ms": None
+    }, "all_offline"
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -102,6 +168,11 @@ def init_db():
         last_seen BIGINT
     )
     """)
+    cur.execute("ALTER TABLE drones ADD COLUMN IF NOT EXISTS pi_last_json TEXT")
+    cur.execute("ALTER TABLE drones ADD COLUMN IF NOT EXISTS pi_last_seen BIGINT")
+    cur.execute("ALTER TABLE drones ADD COLUMN IF NOT EXISTS ground_last_json TEXT")
+    cur.execute("ALTER TABLE drones ADD COLUMN IF NOT EXISTS ground_last_seen BIGINT")
+    cur.execute("ALTER TABLE drones ADD COLUMN IF NOT EXISTS primary_source TEXT DEFAULT 'pi_bridge'")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS orders (
@@ -129,6 +200,18 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    UPDATE drones
+    SET pi_last_json = last_json
+    WHERE pi_last_json IS NULL AND last_json IS NOT NULL
+    """)
+
+    cur.execute("""
+    UPDATE drones
+    SET pi_last_seen = last_seen
+    WHERE pi_last_seen IS NULL AND last_seen IS NOT NULL
+    """)
+
     # Seed admin
     cur.execute("SELECT username FROM users WHERE username = %s", ("admin",))
     if not cur.fetchone():
@@ -149,13 +232,24 @@ def init_db():
             now_ms()
         ))
 
-    # Seed drone
     cur.execute("SELECT id FROM drones WHERE id = %s", ("drone_1",))
     if not cur.fetchone():
         cur.execute("""
-        INSERT INTO drones (id, name, status, last_json, last_seen)
-        VALUES (%s, %s, %s, %s, %s)
-        """, ("drone_1", "SITL-1", "IDLE", None, None))
+        INSERT INTO drones (
+            id, name, status,
+            pi_last_json, pi_last_seen,
+            ground_last_json, ground_last_seen,
+            primary_source
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            "drone_1",
+            "SITL-1",
+            "IDLE",
+            None, None,
+            None, None,
+            "pi_bridge"
+        ))
 
     conn.commit()
     cur.close()
@@ -257,18 +351,45 @@ def row_to_drone(row):
     if not row:
         return None
 
-    last = json.loads(row["last_json"]) if row["last_json"] else None
-    live_status, age_ms = compute_live_status(row["status"], row["last_seen"])
+    primary_source = row.get("primary_source") or "pi_bridge"
+
+    pi_state = build_source_state(
+        row.get("pi_last_json"),
+        row.get("pi_last_seen"),
+        "pi_bridge"
+    )
+
+    ground_state = build_source_state(
+        row.get("ground_last_json"),
+        row.get("ground_last_seen"),
+        "ground_relay"
+    )
+
+    effective, reason = resolve_effective_source(pi_state, ground_state, primary_source)
 
     return {
         "id": row["id"],
         "name": row["name"],
-        "status": live_status,
-        "base_status": row["status"],
-        "last": last,
-        "last_seen": row["last_seen"],
-        "telemetry_age_ms": age_ms,
-        "telemetry_source": (last or {}).get("source", "unknown")
+        "status": effective["status"],
+        "base_status": effective["base_status"],
+        "last": effective["last"],
+        "last_seen": effective["last_seen"],
+        "telemetry_age_ms": effective["age_ms"],
+        "telemetry_source": effective["source"],
+        "telemetry_reason": reason,
+        "primary_source": primary_source,
+        "sources": {
+            "pi_bridge": {
+                "status": pi_state["status"],
+                "age_ms": pi_state["age_ms"],
+                "last_seen": pi_state["last_seen"]
+            },
+            "ground_relay": {
+                "status": ground_state["status"],
+                "age_ms": ground_state["age_ms"],
+                "last_seen": ground_state["last_seen"]
+            }
+        }
     }
 
 
@@ -347,13 +468,17 @@ def get_mission_by_order_id(order_id: str):
     return row_to_mission(row)
 
 
-def get_drone_by_id(drone_id: str):
+def get_drone_row_by_id(drone_id: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM drones WHERE id = %s", (drone_id,))
     row = cur.fetchone()
     cur.close()
     conn.close()
+    return row
+
+def get_drone_by_id(drone_id: str):
+    row = get_drone_row_by_id(drone_id)
     return row_to_drone(row)
 
 
@@ -855,8 +980,8 @@ def create_mission(req: CreateMissionReq, authorization: Optional[str] = Header(
     if str(order["status"]).upper() == "CANCELLED":
         return {"error": "order_cancelled"}
 
-    drone = get_drone_by_id(req.drone_id)
-    if not drone:
+    drone_row = get_drone_row_by_id(req.drone_id)
+    if not drone_row:
         return {"error": "drone_not_found"}
 
     mid = get_next_mission_id()
@@ -1025,9 +1150,11 @@ def bridge_next_mission(drone_id: str):
 
 @app.post("/bridge/telemetry")
 def bridge_telemetry(req: TelemetryReq):
-    drone = get_drone_by_id(req.drone_id)
-    if not drone:
+    drone_row = get_drone_row_by_id(req.drone_id)
+    if not drone_row:
         return {"error": "drone_not_found"}
+
+    source = (req.source or "pi_bridge").strip().lower()
 
     last_data = {
         "lat": req.lat,
@@ -1038,28 +1165,48 @@ def bridge_telemetry(req: TelemetryReq):
         "mode": req.mode,
         "armed": req.armed,
         "ts_ms": req.ts_ms,
-        "source": req.source or "pi_bridge"
+        "source": source
     }
 
-    if req.mode in ["GUIDED", "AUTO", "MISSION", "LAND"]:
-        status = "BUSY"
+    mode_upper = str(req.mode or "").upper()
+    if mode_upper in ["GUIDED", "AUTO", "MISSION", "LAND", "RTL"]:
+        base_status = "BUSY"
     elif req.armed:
-        status = "BUSY"
+        base_status = "BUSY"
     else:
-        status = "IDLE"
+        base_status = "IDLE"
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
-    UPDATE drones
-    SET status = %s, last_json = %s, last_seen = %s
-    WHERE id = %s
-    """, (status, json.dumps(last_data), now_ms(), req.drone_id))
+
+    if source == "pi_bridge":
+        cur.execute("""
+        UPDATE drones
+        SET status = %s,
+            pi_last_json = %s,
+            pi_last_seen = %s
+        WHERE id = %s
+        """, (base_status, json.dumps(last_data), now_ms(), req.drone_id))
+
+    elif source == "ground_relay":
+        cur.execute("""
+        UPDATE drones
+        SET status = %s,
+            ground_last_json = %s,
+            ground_last_seen = %s
+        WHERE id = %s
+        """, (base_status, json.dumps(last_data), now_ms(), req.drone_id))
+
+    else:
+        cur.close()
+        conn.close()
+        return {"error": "invalid_source"}
+
     conn.commit()
     cur.close()
     conn.close()
 
-    return {"ok": True}
+    return {"ok": True, "source": source}
 
 
 @app.post("/bridge/event")
