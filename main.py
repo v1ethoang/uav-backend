@@ -278,9 +278,9 @@ class CreateOrderReq(BaseModel):
 class CreateMissionReq(BaseModel):
     order_id: str
     drone_id: str
-    altitude_m: float = 20.0
-    warehouse_lat: float = 10.850602
-    warehouse_lng: float = 106.771948
+    altitude_m: float = 10.0
+    warehouse_lat: float = 10.9327877
+    warehouse_lng: float = 106.7669519
 
 
 class TelemetryReq(BaseModel):
