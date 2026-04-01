@@ -809,9 +809,9 @@ def dispatch_order(order_id: str, authorization: Optional[str] = Header(default=
         "order_id": order_id,
         "drone_id": "drone_1",
         "status": "START_REQUESTED",
-        "altitude_m": 20.0,
-        "warehouse_lat": 10.850602,
-        "warehouse_lng": 106.771948,
+        "altitude_m": 10.0,
+        "warehouse_lat": 10.9327877,
+        "warehouse_lng": 106.7669519,
         "waypoints": [
             {
                 "lat": drop["lat"],
