@@ -203,14 +203,13 @@ io.on('connection', (socket) => {
 
   // Khi Python trên Drone bắn Telemetry lên
   socket.on('bridge_telemetry', async (data) => {
-    // Phân tích trạng thái giống Python cũ
     const status = data.armed ? 'BUSY' : 'IDLE'; 
     
     // Broadcast KHÔNG ĐỘ TRỄ xuống mọi trình duyệt đang mở Console
     io.emit('frontend_telemetry', {
       ...data,
       status: status,
-      age_ms: 0 
+      age_ms: age_ms 
     });
 
     // Lưu ngầm xuống Database (Không bắt luồng realtime phải chờ)
