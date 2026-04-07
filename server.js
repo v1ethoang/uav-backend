@@ -205,11 +205,14 @@ io.on('connection', (socket) => {
   socket.on('bridge_telemetry', async (data) => {
     const status = data.armed ? 'BUSY' : 'IDLE'; 
     
+    // 1. THÊM DÒNG NÀY: Tính toán độ trễ (age) dựa vào ts_ms từ Python gửi lên
+    const age_ms = data.ts_ms ? (Date.now() - data.ts_ms) : 0;
+    
     // Broadcast KHÔNG ĐỘ TRỄ xuống mọi trình duyệt đang mở Console
     io.emit('frontend_telemetry', {
       ...data,
       status: status,
-      age_ms: age_ms 
+      age_ms: age_ms // Bây giờ dòng này sẽ chạy mượt mà
     });
 
     // Lưu ngầm xuống Database (Không bắt luồng realtime phải chờ)
