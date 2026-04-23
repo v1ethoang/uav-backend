@@ -597,7 +597,7 @@ async function initDefaultAdmin() {
       await pool.query(
         `INSERT INTO users (id, username, password_hash, role, full_name, email, phone, address, created_ts) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [uid, username, hashPassword(password), 'admin', 'Quản trị viên JANUS', 'admin@janus.com', '', '', nowMs()]
+        [uid, username, hashPassword(password), 'admin', 'Admin_JANUS', 'admin@janus.com', '', '', nowMs()]
       );
       console.log('✅ Đã tự động tạo tài khoản: admin / admin123');
     } else {
