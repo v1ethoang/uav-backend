@@ -581,9 +581,41 @@ app.get('/drones/:drone_id', requireUser, async (req, res) => {
 });
 
 // ==========================================
+// KHỞI TẠO DỮ LIỆU MẶC ĐỊNH (SEED DATA)
+// ==========================================
+async function initDefaultAdmin() {
+  try {
+    const username = 'admin';
+    const password = 'admin123';
+    
+    // Kiểm tra xem trong DB đã có tài khoản admin chưa
+    const checkAdmin = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
+    
+    // Nếu chưa có (DB trống hoặc bị xóa) -> Tự động tạo mới
+    if (checkAdmin.rows.length === 0) {
+      const uid = `user_${username}`;
+      await pool.query(
+        `INSERT INTO users (id, username, password_hash, role, full_name, email, phone, address, created_ts) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [uid, username, hashPassword(password), 'admin', 'Quản trị viên JANUS', 'admin@janus.com', '', '', nowMs()]
+      );
+      console.log('✅ Đã tự động tạo tài khoản: admin / admin123');
+    } else {
+      console.log('✅ Tài khoản admin đã tồn tại, bỏ qua bước khởi tạo.');
+    }
+  } catch (err) {
+    console.error('❌ Lỗi khi khởi tạo admin mặc định:', err.message);
+  }
+}
+
+// ==========================================
 // KHỞI ĐỘNG SERVER
 // ==========================================
 const PORT = process.env.PORT || 8000;
-server.listen(PORT, () => {
+
+server.listen(PORT, async () => {
+  // Gọi hàm kiểm tra và tạo admin ngay khi server vừa chạy lên
+  await initDefaultAdmin(); 
+  
   console.log(`🚀 JANUS Backend đang chạy tại: http://localhost:${PORT}`);
 });
