@@ -198,28 +198,63 @@ app.get('/users', requireAdmin, async (req, res) => {
 // ==========================================
 // KÊNH REALTIME (SOCKET.IO)
 // ==========================================
+
+const sourceHealth = {}; 
+
 io.on('connection', (socket) => {
   console.log(`⚡ Drone/Frontend đã kết nối. ID: ${socket.id}`);
 
-  // Khi Python trên Drone bắn Telemetry lên
   socket.on('bridge_telemetry', async (data) => {
+    const droneId = data.drone_id;
     const status = data.armed ? 'BUSY' : 'IDLE'; 
-    
-    // 1. THÊM DÒNG NÀY: Tính toán độ trễ (age) dựa vào ts_ms từ Python gửi lên
     const age_ms = data.ts_ms ? (Date.now() - data.ts_ms) : 0;
-    
-    // Broadcast KHÔNG ĐỘ TRỄ xuống mọi trình duyệt đang mở Console
+
+    // 1. Khởi tạo và cập nhật thời gian nhận tín hiệu cuối cùng của từng nguồn
+    if (!sourceHealth[droneId]) {
+      sourceHealth[droneId] = { pi_bridge: 0, ground_relay: 0 };
+    }
+    sourceHealth[droneId][data.source] = Date.now();
+
+    // 2. Kiểm tra xem các nguồn có đang "sống" không (Timeout 3.5 giây)
+    const isPiAlive = (Date.now() - sourceHealth[droneId].pi_bridge) < 3500;
+    const isRelayAlive = (Date.now() - sourceHealth[droneId].ground_relay) < 3500;
+
+    let shouldProcess = false;
+
+    // 3. LOGIC CHUYỂN ĐỔI ƯU TIÊN (SWAP NGUỒN) THEO TRẠNG THÁI BAY
+    if (data.armed) {
+      // ---> ĐANG BAY: Ưu tiên Telemetry Radio (ground_relay)
+      if (data.source === 'ground_relay') {
+        shouldProcess = true;
+      } else if (data.source === 'pi_bridge' && !isRelayAlive) {
+        // Phương án dự phòng: Chỉ dùng Pi WiFi nếu sóng Radio bị đứt hẳn
+        shouldProcess = true; 
+      }
+    } else {
+      // ---> MẶT ĐẤT (Chờ / Vừa hạ cánh xong): Ưu tiên Pi WiFi (pi_bridge)
+      if (data.source === 'pi_bridge') {
+        shouldProcess = true;
+      } else if (data.source === 'ground_relay' && !isPiAlive) {
+        // Phương án dự phòng: Chỉ dùng Radio nếu Pi mất kết nối mạng
+        shouldProcess = true;
+      }
+    }
+
+    // 4. Nếu gói tin không thuộc nguồn được ưu tiên hiện tại -> HỦY BỎ (Tránh giật map)
+    if (!shouldProcess) return;
+
+    // 5. Phát xuống Frontend (Lúc này dữ liệu đã được lọc sạch sẽ và mượt mà)
     io.emit('frontend_telemetry', {
       ...data,
       status: status,
-      age_ms: age_ms // Bây giờ dòng này sẽ chạy mượt mà
+      age_ms: age_ms 
     });
 
-    // Lưu ngầm xuống Database (Không bắt luồng realtime phải chờ)
+    // 6. Lưu ngầm xuống Database
     try {
       await pool.query(
         `UPDATE drones SET status = $1, pi_last_json = $2, pi_last_seen = $3 WHERE id = $4`,
-        [status, JSON.stringify(data), Date.now(), data.drone_id]
+        [status, JSON.stringify(data), Date.now(), droneId]
       );
     } catch (err) {
       console.error('Lỗi update db telemetry:', err.message);
@@ -257,17 +292,21 @@ io.on('connection', (socket) => {
 
     // 3. Cập nhật Database ngầm
     try {
-      if (eventData.type === 'ARRIVED') {
-        await pool.query(`UPDATE orders SET status = 'ARRIVED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
-      } else if (eventData.type === 'DELIVERED') {
-        await pool.query(`UPDATE orders SET status = 'DELIVERED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
-      } else if (eventData.type === 'COMPLETED') {
-        await pool.query(`UPDATE orders SET status = 'COMPLETED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
-        await pool.query(`UPDATE missions SET status = 'DONE' WHERE id = $1`, [eventData.mission_id]);
-      } else if (eventData.type === 'FAILED') {
-        await pool.query(`UPDATE orders SET status = 'FAILED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
-        await pool.query(`UPDATE missions SET status = 'FAILED' WHERE id = $1`, [eventData.mission_id]);
-      }
+      if (eventData.type === 'STARTED') {
+      await pool.query(`UPDATE orders SET status = 'IN_FLIGHT' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
+      await pool.query(`UPDATE missions SET status = 'RUNNING' WHERE id = $1`, [eventData.mission_id]);
+    } else if (eventData.type === 'ARRIVED') {
+      // Đã xóa phần lặp thừa ở đây
+      await pool.query(`UPDATE orders SET status = 'ARRIVED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
+    } else if (eventData.type === 'DELIVERED') {
+      await pool.query(`UPDATE orders SET status = 'DELIVERED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
+    } else if (eventData.type === 'COMPLETED') {
+      await pool.query(`UPDATE orders SET status = 'COMPLETED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
+      await pool.query(`UPDATE missions SET status = 'DONE' WHERE id = $1`, [eventData.mission_id]);
+    } else if (eventData.type === 'FAILED') {
+      await pool.query(`UPDATE orders SET status = 'FAILED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
+      await pool.query(`UPDATE missions SET status = 'FAILED' WHERE id = $1`, [eventData.mission_id]);
+    }
     } catch (err) { 
       console.error('Lỗi lưu event:', err.message); 
     }
@@ -446,6 +485,9 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
       created_by: req.user.username, created_ts: ts
     };
 
+    // --- THÊM DÒNG NÀY ĐỂ PUSH LỆNH XUỐNG DRONE QUA SOCKET.IO ---
+    io.emit('new_mission', missionObj);
+
     res.json({ ok: true, mission: missionObj });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -487,6 +529,7 @@ app.post('/missions', requireAdmin, async (req, res) => {
       altitude_m: 0.0, warehouse_lat: 0.0, warehouse_lng: 0.0, waypoints,
       created_by: req.user.username, created_ts: ts
     };
+    io.emit('new_mission', missionObj);
     res.json(missionObj);
   } catch (err) {
     res.status(500).json({ error: err.message });
