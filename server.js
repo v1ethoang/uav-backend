@@ -296,7 +296,6 @@ io.on('connection', (socket) => {
       await pool.query(`UPDATE orders SET status = 'IN_FLIGHT' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
       await pool.query(`UPDATE missions SET status = 'RUNNING' WHERE id = $1`, [eventData.mission_id]);
     } else if (eventData.type === 'ARRIVED') {
-      // Đã xóa phần lặp thừa ở đây
       await pool.query(`UPDATE orders SET status = 'ARRIVED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
     } else if (eventData.type === 'DELIVERED') {
       await pool.query(`UPDATE orders SET status = 'DELIVERED' FROM missions WHERE orders.id = missions.order_id AND missions.id = $1`, [eventData.mission_id]);
