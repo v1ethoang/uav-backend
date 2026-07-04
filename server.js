@@ -117,17 +117,19 @@ app.post('/auth/login', async (req, res) => {
     const userRes = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
     const user = userRes.rows[0];
 
+    // Kiểm tra tài khoản và mã băm mật khẩu
     if (!user || user.password_hash !== hashPassword(password)) {
       return res.status(400).json({ error: 'invalid_credentials' });
     }
 
+    // Tạo token phiên đăng nhập
     const token = crypto.randomBytes(32).toString('hex');
 
-    // ĐÃ SỬA: Thêm trường user.id vào câu lệnh lưu phiên đăng nhập
+    // ĐỒNG BỘ: Sử dụng user.id viết thường để chèn vào bảng sessions
     await pool.query(
       `INSERT INTO sessions (token, user_id, username, created_ts) VALUES ($1, $2, $3, $4)
        ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, username = EXCLUDED.username, created_ts = EXCLUDED.created_ts`,
-      [token, user.id, username, nowMs()]
+      [token, user.id, username, nowMs()] 
     );
 
     res.json({ ok: true, token: token, user: publicUser(user) });
