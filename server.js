@@ -30,7 +30,6 @@ function nowMs() {
   return Date.now();
 }
 
-// Middleware: Kiểm tra đăng nhập (tương đương get_current_user / require_user bên Python)
 async function requireUser(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -39,15 +38,15 @@ async function requireUser(req, res, next) {
 
   const token = authHeader.replace('Bearer ', '').trim();
   try {
-    // Tìm session
-    const sessionRes = await pool.query('SELECT username FROM sessions WHERE token = $1', [token]);
+    // ĐÃ SỬA: Lấy user_id từ bảng sessions mới
+    const sessionRes = await pool.query('SELECT user_id FROM sessions WHERE token = $1', [token]);
     if (sessionRes.rows.length === 0) return res.status(401).json({ error: 'unauthorized' });
 
-    // Tìm user
-    const userRes = await pool.query('SELECT * FROM users WHERE username = $1', [sessionRes.rows[0].username]);
+    // ĐÃ SỬA: Tìm user bằng id (Primary Key) thay vì username để tăng tốc độ quét CSDL
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [sessionRes.rows[0].user_id]);
     if (userRes.rows.length === 0) return res.status(401).json({ error: 'unauthorized' });
 
-    req.user = userRes.rows[0]; // Lưu thông tin user vào req để các API sau xài
+    req.user = userRes.rows[0]; 
     req.token = token;
     next();
   } catch (err) {
@@ -109,7 +108,6 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-// 2. Đăng nhập
 app.post('/auth/login', async (req, res) => {
   const username = (req.body.username || '').trim();
   const password = req.body.password || '';
@@ -122,13 +120,13 @@ app.post('/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'invalid_credentials' });
     }
 
-    // Tạo token hex 32 byte giống hàm secrets.token_hex(32) của Python
     const token = crypto.randomBytes(32).toString('hex');
 
+    // ĐÃ SỬA: Thêm trường user.id vào câu lệnh lưu phiên đăng nhập
     await pool.query(
-      `INSERT INTO sessions (token, username, created_ts) VALUES ($1, $2, $3)
-       ON CONFLICT (token) DO UPDATE SET username = EXCLUDED.username, created_ts = EXCLUDED.created_ts`,
-      [token, username, nowMs()]
+      `INSERT INTO sessions (token, user_id, username, created_ts) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, username = EXCLUDED.username, created_ts = EXCLUDED.created_ts`,
+      [token, user.id, username, nowMs()]
     );
 
     res.json({ ok: true, token: token, user: publicUser(user) });
@@ -376,23 +374,27 @@ async function getActiveMissionByOrderId(orderId) {
 // ORDERS API (ĐƠN HÀNG)
 // ==========================================
 
-// 1. Tạo đơn hàng mới
 app.post('/orders', requireUser, async (req, res) => {
   const { dropoff, note } = req.body;
   try {
-    const oid = await getNextOrderId();
     const status = 'CREATED';
-    const created_ts = nowMs();
+    const created_ts = Date.now();
 
-    await pool.query(
-      `INSERT INTO orders (id, created_by, dropoff_json, note, status, created_ts) VALUES ($1, $2, $3, $4, $5, $6)`,
-      [oid, req.user.username, JSON.stringify(dropoff), note, status, created_ts]
+    // Không truyền id thủ công nữa, cho DB tự sinh và dùng RETURNING id để lấy ra ngay lập tức
+    const result = await pool.query(
+      `INSERT INTO orders (created_by, dropoff_json, note, status, created_ts) 
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [req.user.id, JSON.stringify(dropoff), note, status, created_ts] 
     );
 
-    const newOrder = { id: oid, created_by: req.user.username, dropoff, note, status, created_ts };
+    const oid = result.rows[0].id; // Lấy ra ID số (ví dụ: 1, 2, 3...)
     
-    // MA THUẬT REALTIME: Bắn thông báo cho tất cả Admin đang mở Console
-    io.emit('frontend_event', { type: 'NEW_ORDER', detail: `Đơn mới: ${oid}`, ts_ms: created_ts });
+    // Tạo định dạng chuỗi "order_X" để đảm bảo Frontend không cần sửa đổi giao diện hiển thị
+    const orderStringId = `order_${oid}`; 
+
+    const newOrder = { id: orderStringId, created_by: req.user.username, dropoff, note, status, created_ts };
+    
+    io.emit('frontend_event', { type: 'NEW_ORDER', detail: `Đơn mới: ${orderStringId}`, ts_ms: created_ts });
 
     res.json(newOrder);
   } catch (err) {
@@ -448,9 +450,14 @@ app.post('/orders/:order_id/cancel', requireUser, async (req, res) => {
   }
 });
 
-// 4. Admin Dispatch (Tiến hành giao)
 app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
-  const orderId = req.params.order_id;
+  // Vì ID của order lúc này đã chuyển thành dạng số INT (được bọc trong chuỗi "order_X" ở frontend gửi lên)
+  // Ta cần trích xuất phần số nguyên từ chuỗi đó ra (ví dụ: "order_5" -> 5)
+  const orderStringId = req.params.order_id;
+  const orderId = parseInt(orderStringId.replace('order_', ''));
+
+  if (!isFinite(orderId)) return res.status(400).json({ error: 'invalid_order_id' });
+
   try {
     const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'order_not_found' });
@@ -463,30 +470,29 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
     const existingMission = await getActiveMissionByOrderId(orderId);
     if (existingMission) return res.status(400).json({ error: 'mission_already_exists' });
 
-    const mid = getNextMissionId();
     const waypoints = [{ lat: order.dropoff.lat, lng: order.dropoff.lng }];
     const missionStatus = 'START_REQUESTED';
     const ts = nowMs();
 
-    // Tạo Mission mới
-    await pool.query(
-      `INSERT INTO missions (id, order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [mid, orderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.username, ts]
+    // ĐÃ SỬA: Cho DB tự tăng ID của mission, sử dụng RETURNING id và chèn req.user.id
+    const missionInsertRes = await pool.query(
+      `INSERT INTO missions (order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [orderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts]
     );
 
-    // Cập nhật Order thành ASSIGNED
+    const mid = missionInsertRes.rows[0].id; // Lấy ID số của mission vừa sinh ra từ DB
+    const missionStringId = `mission_${mid}`; // Ép chuỗi "mission_X" để đồng bộ với Frontend
+
     await pool.query(`UPDATE orders SET status = 'ASSIGNED' WHERE id = $1`, [orderId]);
 
     const missionObj = {
-      id: mid, order_id: orderId, drone_id: 'drone_1', status: missionStatus,
+      id: missionStringId, order_id: orderStringId, drone_id: 'drone_1', status: missionStatus,
       altitude_m: 0.0, warehouse_lat: 0.0, warehouse_lng: 0.0, waypoints,
       created_by: req.user.username, created_ts: ts
     };
 
-    // --- THÊM DÒNG NÀY ĐỂ PUSH LỆNH XUỐNG DRONE QUA SOCKET.IO ---
     io.emit('new_mission', missionObj);
-
     res.json({ ok: true, mission: missionObj });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -660,4 +666,8 @@ server.listen(PORT, async () => {
   await initDefaultAdmin(); 
   
   console.log(`🚀 JANUS Backend đang chạy tại: http://localhost:${PORT}`);
+  
 });
+
+
+
