@@ -460,14 +460,12 @@ app.post('/orders/:order_id/cancel', requireUser, async (req, res) => {
 
 app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
   const orderStringId = req.params.order_id;
-  
-  // Đổi tên biến từ orderId thành numericOrderId để đồng bộ với Database
+  // Đồng bộ tên biến thành numericOrderId cho toàn hàm
   const numericOrderId = parseInt(orderStringId.replace('order_', ''));
 
   if (!isFinite(numericOrderId)) return res.status(400).json({ error: 'invalid_order_id' });
 
   try {
-    // 1. Kiểm tra đơn hàng tồn tại bằng ID số nguyên
     const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [numericOrderId]);
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'order_not_found' });
     const order = rowToOrder(orderRes.rows[0]);
@@ -476,7 +474,6 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
     if (statusUpper === 'CANCELLED') return res.status(400).json({ error: 'order_cancelled' });
     if (['DELIVERED', 'COMPLETED', 'DONE'].includes(statusUpper)) return res.status(400).json({ error: 'order_completed' });
 
-    // 2. Kiểm tra xem đơn này đã được gán hành trình (mission) nào chưa
     const existingMission = await getActiveMissionByOrderId(numericOrderId);
     if (existingMission) return res.status(400).json({ error: 'mission_already_exists' });
 
@@ -484,30 +481,22 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
     const missionStatus = 'START_REQUESTED';
     const ts = nowMs();
 
-    // 3. Chèn vào bảng missions bằng numericOrderId (Đã được sửa lại an toàn)
+    // Truyền chính xác numericOrderId vào tham số đầu tiên ($1)
     const missionInsertRes = await pool.query(
       `INSERT INTO missions (order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [numericOrderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts]
     );
 
-    const mid = missionInsertRes.rows[0].id; // Lấy ID số tự tăng của mission vừa tạo
-    const missionStringId = `mission_${mid}`; // Bọc chuỗi gửi lên Frontend để khớp giao diện cũ
+    const mid = missionInsertRes.rows[0].id; 
+    const missionStringId = `mission_${mid}`; 
 
-    // 4. Cập nhật trạng thái đơn hàng sang ASSIGNED bằng ID số nguyên
     await pool.query(`UPDATE orders SET status = 'ASSIGNED' WHERE id = $1`, [numericOrderId]);
 
     const missionObj = {
-      id: missionStringId, 
-      order_id: orderStringId, 
-      drone_id: 'drone_1', 
-      status: missionStatus,
-      altitude_m: 0.0, 
-      warehouse_lat: 0.0, 
-      warehouse_lng: 0.0, 
-      waypoints,
-      created_by: req.user.username, 
-      created_ts: ts
+      id: missionStringId, order_id: orderStringId, drone_id: 'drone_1', status: missionStatus,
+      altitude_m: 0.0, warehouse_lat: 0.0, warehouse_lng: 0.0, waypoints,
+      created_by: req.user.username, created_ts: ts
     };
 
     io.emit('new_mission', missionObj);
@@ -606,7 +595,6 @@ app.get('/missions', requireUser, async (req, res) => {
 // BRIDGE & DRONE API (GIAO TIẾP VỚI DRONE)
 // ==========================================
 
-// 1. Drone hỏi xin Mission tiếp theo
 app.get('/bridge/missions/next', async (req, res) => {
   const droneId = req.query.drone_id;
   try {
@@ -617,13 +605,15 @@ app.get('/bridge/missions/next', async (req, res) => {
 
     if (result.rows.length === 0) return res.json({ mission: null });
 
-    const mission = rowToMission(result.rows[0]);
+    // Lưu lại bản ghi thô (raw row) từ DB để lấy ID số nguyên gốc trước khi format qua rowToMission
+    const rawMissionRow = result.rows[0];
+    const mission = rowToMission(rawMissionRow);
 
-    // Drone bắt đầu bay -> Cập nhật trạng thái
-    await pool.query(`UPDATE missions SET status = 'RUNNING' WHERE id = $1`, [mission.id]);
-    await pool.query(`UPDATE orders SET status = 'IN_FLIGHT' WHERE id = $1`, [mission.order_id]);
+    // Sử dụng ID số nguyên gốc (rawMissionRow.id và rawMissionRow.order_id) để làm việc với DB
+    await pool.query(`UPDATE missions SET status = 'RUNNING' WHERE id = $1`, [rawMissionRow.id]);
+    await pool.query(`UPDATE orders SET status = 'IN_FLIGHT' WHERE id = $1`, [rawMissionRow.order_id]);
 
-    const updatedMission = await pool.query(`SELECT * FROM missions WHERE id = $1`, [mission.id]);
+    const updatedMission = await pool.query(`SELECT * FROM missions WHERE id = $1`, [rawMissionRow.id]);
     res.json({ mission: rowToMission(updatedMission.rows[0]) });
   } catch (err) {
     res.status(500).json({ error: err.message });
