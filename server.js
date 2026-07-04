@@ -79,6 +79,14 @@ function publicUser(user) {
   };
 }
 
+// Hàm bổ trợ chuyển đổi qua lại giữa ID hiển thị (String) và ID CSDL (Int)
+function parseStringToId(stringId, prefix) {
+  if (!stringId) return null;
+  if (typeof stringId === 'number') return stringId;
+  const idInt = parseInt(stringId.replace(prefix, ''));
+  return isFinite(idInt) ? idInt : null;
+}
+
 // ==========================================
 // AUTH API
 // ==========================================
@@ -321,12 +329,11 @@ io.on('connection', (socket) => {
 // HELPERS CHO ORDERS & MISSIONS
 // ==========================================
 
-// Parse dữ liệu từ CSDL (chuyển JSON Text thành Object)
 function rowToOrder(row) {
   if (!row) return null;
   return {
-    id: row.id,
-    created_by: row.created_by,
+    id: `order_${row.id}`, // Ép thành chuỗi hiển thị "order_X" cho Frontend
+    created_by: row.created_by, 
     dropoff: JSON.parse(row.dropoff_json),
     note: row.note,
     status: row.status,
@@ -337,8 +344,8 @@ function rowToOrder(row) {
 function rowToMission(row) {
   if (!row) return null;
   return {
-    id: row.id,
-    order_id: row.order_id,
+    id: `mission_${row.id}`, // Ép thành chuỗi hiển thị "mission_X" cho Frontend
+    order_id: `order_${row.order_id}`,
     drone_id: row.drone_id,
     status: row.status,
     altitude_m: row.altitude_m,
@@ -363,13 +370,12 @@ function getNextMissionId() {
   return `mission_${nowMs()}`;
 }
 
-// Lấy mission đang chạy của một đơn hàng
-async function getActiveMissionByOrderId(orderId) {
+async function getActiveMissionByOrderId(numericOrderId) {
   const res = await pool.query(
     `SELECT * FROM missions WHERE order_id = $1 AND UPPER(status) NOT IN ('DONE', 'FAILED', 'CANCELLED') ORDER BY created_ts DESC LIMIT 1`,
-    [orderId]
+    [numericOrderId]
   );
-  return rowToMission(res.rows[0]);
+  return res.rows[0] ? res.rows[0] : null; 
 }
 
 
@@ -405,14 +411,14 @@ app.post('/orders', requireUser, async (req, res) => {
   }
 });
 
-// 2. Lấy danh sách đơn hàng
 app.get('/orders', requireUser, async (req, res) => {
   try {
     let result;
     if (req.user.role === 'admin') {
       result = await pool.query('SELECT * FROM orders ORDER BY created_ts DESC');
     } else {
-      result = await pool.query('SELECT * FROM orders WHERE created_by = $1 ORDER BY created_ts DESC', [req.user.username]);
+      // ĐÃ SỬA: Lọc theo id thay vì username
+      result = await pool.query('SELECT * FROM orders WHERE created_by = $1 ORDER BY created_ts DESC', [req.user.id]);
     }
     res.json(result.rows.map(rowToOrder));
   } catch (err) {
@@ -420,34 +426,33 @@ app.get('/orders', requireUser, async (req, res) => {
   }
 });
 
-// 3. Hủy đơn hàng
 app.post('/orders/:order_id/cancel', requireUser, async (req, res) => {
-  const orderId = req.params.order_id;
+  const orderStringId = req.params.order_id;
+  const numericOrderId = parseStringToId(orderStringId, 'order_'); // ĐÃ SỬA
+
   try {
-    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [numericOrderId]);
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'order_not_found' });
-    const order = rowToOrder(orderRes.rows[0]);
+    const rawOrder = orderRes.rows[0];
 
     const isAdmin = req.user.role === 'admin';
-    const isOwner = order.created_by === req.user.username;
+    const isOwner = rawOrder.created_by === req.user.id; // ĐÃ SỬA từ username sang id
 
     if (!isAdmin && !isOwner) return res.status(403).json({ error: 'forbidden' });
 
     const blockedStatuses = ['DELIVERED', 'COMPLETED', 'DONE', 'CANCELLED'];
-    if (blockedStatuses.includes(order.status.toUpperCase())) {
+    if (blockedStatuses.includes(rawOrder.status.toUpperCase())) {
       return res.status(400).json({ error: 'cannot_cancel_order' });
     }
 
-    // Cập nhật trạng thái Order
-    await pool.query(`UPDATE orders SET status = 'CANCELLED' WHERE id = $1`, [orderId]);
+    await pool.query(`UPDATE orders SET status = 'CANCELLED' WHERE id = $1`, [numericOrderId]);
 
-    // Nếu có Mission đang dở dang thì Cancel luôn Mission
-    const mission = await getActiveMissionByOrderId(orderId);
+    const mission = await getActiveMissionByOrderId(numericOrderId);
     if (mission && !['DONE', 'FAILED', 'CANCELLED'].includes(mission.status.toUpperCase())) {
       await pool.query(`UPDATE missions SET status = 'CANCELLED' WHERE id = $1`, [mission.id]);
     }
 
-    res.json({ ok: true, order_id: orderId, status: 'CANCELLED' });
+    res.json({ ok: true, order_id: orderStringId, status: 'CANCELLED' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -477,11 +482,11 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
     const missionStatus = 'START_REQUESTED';
     const ts = nowMs();
 
-    // ĐÃ SỬA: Cho DB tự tăng ID của mission, sử dụng RETURNING id và chèn req.user.id
+    // Tìm đến đoạn INSERT INTO missions bên trong endpoint này và sửa tham số kế cuối:
     const missionInsertRes = await pool.query(
       `INSERT INTO missions (order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [orderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts]
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [numericOrderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts] // ĐÃ SỬA: req.user.id
     );
 
     const mid = missionInsertRes.rows[0].id; // Lấy ID số của mission vừa sinh ra từ DB
@@ -507,33 +512,38 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
 // MISSIONS API (ĐIỀU PHỐI BAY)
 // ==========================================
 
-// 1. Tạo Mission thủ công
 app.post('/missions', requireAdmin, async (req, res) => {
-  const { order_id, drone_id } = req.body;
+  const { order_id, drone_id } = req.body; 
+  const numericOrderId = parseStringToId(order_id, 'order_'); // ĐÃ THÊM
+
   try {
-    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [order_id]);
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [numericOrderId]);
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'order_not_found' });
-    const order = rowToOrder(orderRes.rows[0]);
+    const orderRaw = orderRes.rows[0];
+    const dropoff = JSON.parse(orderRaw.dropoff_json);
 
-    if (order.status.toUpperCase() === 'CANCELLED') return res.status(400).json({ error: 'order_cancelled' });
+    if (orderRaw.status.toUpperCase() === 'CANCELLED') return res.status(400).json({ error: 'order_cancelled' });
 
-    const existingMission = await getActiveMissionByOrderId(order_id);
+    const existingMission = await getActiveMissionByOrderId(numericOrderId);
     if (existingMission) return res.status(400).json({ error: 'mission_already_exists' });
 
-    const mid = getNextMissionId();
-    const waypoints = [{ lat: order.dropoff.lat, lng: order.dropoff.lng }];
+    const waypoints = [{ lat: dropoff.lat, lng: dropoff.lng }];
     const ts = nowMs();
 
-    await pool.query(
-      `INSERT INTO missions (id, order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [mid, order_id, drone_id, 'ASSIGNED', 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.username, ts]
+    // ĐÃ SỬA: Không truyền id thủ công dạng chuỗi, dùng RETURNING id và req.user.id
+    const missionInsertRes = await pool.query(
+      `INSERT INTO missions (order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [numericOrderId, drone_id, 'ASSIGNED', 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts]
     );
 
-    await pool.query(`UPDATE orders SET status = 'QUEUED' WHERE id = $1`, [order_id]);
+    const mid = missionInsertRes.rows[0].id;
+    const missionStringId = `mission_${mid}`;
+
+    await pool.query(`UPDATE orders SET status = 'QUEUED' WHERE id = $1`, [numericOrderId]);
 
     const missionObj = {
-      id: mid, order_id, drone_id, status: 'ASSIGNED',
+      id: missionStringId, order_id, drone_id, status: 'ASSIGNED',
       altitude_m: 0.0, warehouse_lat: 0.0, warehouse_lng: 0.0, waypoints,
       created_by: req.user.username, created_ts: ts
     };
@@ -544,18 +554,19 @@ app.post('/missions', requireAdmin, async (req, res) => {
   }
 });
 
-// 2. Bắt đầu Mission
 app.post('/missions/:mission_id/start', requireAdmin, async (req, res) => {
-  const missionId = req.params.mission_id;
+  const missionStringId = req.params.mission_id;
+  const numericMissionId = parseStringToId(missionStringId, 'mission_'); // ĐÃ THÊM
+
   try {
-    const missionRes = await pool.query('SELECT * FROM missions WHERE id = $1', [missionId]);
+    const missionRes = await pool.query('SELECT * FROM missions WHERE id = $1', [numericMissionId]);
     if (missionRes.rows.length === 0) return res.status(404).json({ error: 'mission_not_found' });
-    const mission = rowToMission(missionRes.rows[0]);
+    const missionRaw = missionRes.rows[0];
 
-    if (mission.status.toUpperCase() === 'CANCELLED') return res.status(400).json({ error: 'mission_cancelled' });
+    if (missionRaw.status.toUpperCase() === 'CANCELLED') return res.status(400).json({ error: 'mission_cancelled' });
 
-    await pool.query(`UPDATE missions SET status = 'START_REQUESTED' WHERE id = $1`, [missionId]);
-    await pool.query(`UPDATE orders SET status = 'ASSIGNED' WHERE id = $1`, [mission.order_id]);
+    await pool.query(`UPDATE missions SET status = 'START_REQUESTED' WHERE id = $1`, [numericMissionId]);
+    await pool.query(`UPDATE orders SET status = 'ASSIGNED' WHERE id = $1`, [missionRaw.order_id]);
 
     res.json({ ok: true });
   } catch (err) {
@@ -563,16 +574,16 @@ app.post('/missions/:mission_id/start', requireAdmin, async (req, res) => {
   }
 });
 
-// 3. Lấy danh sách Mission
 app.get('/missions', requireUser, async (req, res) => {
   try {
     let result;
     if (req.user.role === 'admin') {
       result = await pool.query('SELECT * FROM missions ORDER BY created_ts DESC');
     } else {
+      // ĐÃ SỬA: o.created_by map với req.user.id
       result = await pool.query(
         `SELECT m.* FROM missions m JOIN orders o ON m.order_id = o.id WHERE o.created_by = $1 ORDER BY m.created_ts DESC`,
-        [req.user.username]
+        [req.user.id]
       );
     }
     res.json(result.rows.map(rowToMission));
