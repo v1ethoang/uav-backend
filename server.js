@@ -642,29 +642,25 @@ app.get('/drones/:drone_id', requireUser, async (req, res) => {
   }
 });
 
-// ==========================================
-// KHỞI TẠO DỮ LIỆU MẶC ĐỊNH (SEED DATA)
-// ==========================================
 async function initDefaultAdmin() {
   try {
     const username = 'admin';
     const password = 'admin123';
-    
-    // Kiểm tra xem trong DB đã có tài khoản admin chưa
-    const checkAdmin = await pool.query('SELECT username FROM users WHERE username = $1', [username]);
-    
-    // Nếu chưa có (DB trống hoặc bị xóa) -> Tự động tạo mới
-    if (checkAdmin.rows.length === 0) {
-      const uid = `user_${username}`;
-      await pool.query(
-        `INSERT INTO users (id, username, password_hash, role, full_name, email, phone, address, created_ts) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [uid, username, hashPassword(password), 'admin', 'Admin_JANUS', 'admin@janus.com', '', '', nowMs()]
-      );
-      console.log('✅ Đã tự động tạo tài khoản: admin / admin123');
-    } else {
-      console.log('✅ Tài khoản admin đã tồn tại, bỏ qua bước khởi tạo.');
-    }
+    const uid = `user_${username}`;
+    const hashedParams = hashPassword(password); // '240ee524933d60c284d156acaa9203e390bc02c8c366ff852b75f50decfb1964'
+
+    // SỬA LẠI: Dùng lệnh UPSERT (INSERT ... ON CONFLICT) để ép Database luôn cập nhật password_hash chuẩn SHA256
+    await pool.query(
+      `INSERT INTO users (id, username, password_hash, role, full_name, email, phone, address, created_ts) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (username) DO UPDATE 
+       SET password_hash = EXCLUDED.password_hash, role = 'admin'`,
+      [uid, username, hashedParams, 'admin', 'Admin_JANUS', 'admin@janus.com', '', '', nowMs()]
+    );
+    console.log('============= JANUS AUTH SECURITY =============');
+    console.log('✅ Đã đồng bộ tài khoản quản trị viên chuẩn SHA256!');
+    console.log('👉 Username: admin / Password: admin123');
+    console.log('===============================================');
   } catch (err) {
     console.error('❌ Lỗi khi khởi tạo admin mặc định:', err.message);
   }
