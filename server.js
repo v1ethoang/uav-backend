@@ -66,8 +66,9 @@ async function requireAdmin(req, res, next) {
 
 // Hàm format lại user để trả về frontend (ẩn password)
 function publicUser(user) {
+  if (!user) return null;
   return {
-    id: user.id,
+    id: user.id, 
     username: user.username,
     role: user.role,
     full_name: user.full_name || '',
@@ -668,6 +669,3 @@ server.listen(PORT, async () => {
   console.log(`🚀 JANUS Backend đang chạy tại: http://localhost:${PORT}`);
   
 });
-
-
-
