@@ -459,15 +459,16 @@ app.post('/orders/:order_id/cancel', requireUser, async (req, res) => {
 });
 
 app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
-  // Vì ID của order lúc này đã chuyển thành dạng số INT (được bọc trong chuỗi "order_X" ở frontend gửi lên)
-  // Ta cần trích xuất phần số nguyên từ chuỗi đó ra (ví dụ: "order_5" -> 5)
   const orderStringId = req.params.order_id;
-  const orderId = parseInt(orderStringId.replace('order_', ''));
+  
+  // Đổi tên biến từ orderId thành numericOrderId để đồng bộ với Database
+  const numericOrderId = parseInt(orderStringId.replace('order_', ''));
 
-  if (!isFinite(orderId)) return res.status(400).json({ error: 'invalid_order_id' });
+  if (!isFinite(numericOrderId)) return res.status(400).json({ error: 'invalid_order_id' });
 
   try {
-    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    // 1. Kiểm tra đơn hàng tồn tại bằng ID số nguyên
+    const orderRes = await pool.query('SELECT * FROM orders WHERE id = $1', [numericOrderId]);
     if (orderRes.rows.length === 0) return res.status(404).json({ error: 'order_not_found' });
     const order = rowToOrder(orderRes.rows[0]);
 
@@ -475,29 +476,38 @@ app.post('/orders/:order_id/dispatch', requireAdmin, async (req, res) => {
     if (statusUpper === 'CANCELLED') return res.status(400).json({ error: 'order_cancelled' });
     if (['DELIVERED', 'COMPLETED', 'DONE'].includes(statusUpper)) return res.status(400).json({ error: 'order_completed' });
 
-    const existingMission = await getActiveMissionByOrderId(orderId);
+    // 2. Kiểm tra xem đơn này đã được gán hành trình (mission) nào chưa
+    const existingMission = await getActiveMissionByOrderId(numericOrderId);
     if (existingMission) return res.status(400).json({ error: 'mission_already_exists' });
 
     const waypoints = [{ lat: order.dropoff.lat, lng: order.dropoff.lng }];
     const missionStatus = 'START_REQUESTED';
     const ts = nowMs();
 
-    // Tìm đến đoạn INSERT INTO missions bên trong endpoint này và sửa tham số kế cuối:
+    // 3. Chèn vào bảng missions bằng numericOrderId (Đã được sửa lại an toàn)
     const missionInsertRes = await pool.query(
       `INSERT INTO missions (order_id, drone_id, status, altitude_m, warehouse_lat, warehouse_lng, waypoints_json, created_by, created_ts) 
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [numericOrderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts] // ĐÃ SỬA: req.user.id
+      [numericOrderId, 'drone_1', missionStatus, 0.0, 0.0, 0.0, JSON.stringify(waypoints), req.user.id, ts]
     );
 
-    const mid = missionInsertRes.rows[0].id; // Lấy ID số của mission vừa sinh ra từ DB
-    const missionStringId = `mission_${mid}`; // Ép chuỗi "mission_X" để đồng bộ với Frontend
+    const mid = missionInsertRes.rows[0].id; // Lấy ID số tự tăng của mission vừa tạo
+    const missionStringId = `mission_${mid}`; // Bọc chuỗi gửi lên Frontend để khớp giao diện cũ
 
-    await pool.query(`UPDATE orders SET status = 'ASSIGNED' WHERE id = $1`, [orderId]);
+    // 4. Cập nhật trạng thái đơn hàng sang ASSIGNED bằng ID số nguyên
+    await pool.query(`UPDATE orders SET status = 'ASSIGNED' WHERE id = $1`, [numericOrderId]);
 
     const missionObj = {
-      id: missionStringId, order_id: orderStringId, drone_id: 'drone_1', status: missionStatus,
-      altitude_m: 0.0, warehouse_lat: 0.0, warehouse_lng: 0.0, waypoints,
-      created_by: req.user.username, created_ts: ts
+      id: missionStringId, 
+      order_id: orderStringId, 
+      drone_id: 'drone_1', 
+      status: missionStatus,
+      altitude_m: 0.0, 
+      warehouse_lat: 0.0, 
+      warehouse_lng: 0.0, 
+      waypoints,
+      created_by: req.user.username, 
+      created_ts: ts
     };
 
     io.emit('new_mission', missionObj);
